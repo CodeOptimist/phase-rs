@@ -1,12 +1,12 @@
 use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityBlockKind, AbilityBlockReason, AbilityCondition,
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AdditionalCost, CardPlayMode,
-    CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification, CostObjectCount,
-    CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, FilterProp, GameRestriction,
-    ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope, ProhibitedActivity,
-    QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry, RestrictionPlayerScope,
-    StaticCondition, StaticDefinition, SubAbilityLink, TapCreaturesRequirement, TargetFilter,
-    TargetRef,
+    CardSelectionMode, CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification,
+    CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, FilterProp,
+    GameRestriction, ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope,
+    ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
+    RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
+    TapCreaturesRequirement, TargetFilter, TargetRef,
 };
 use crate::types::actions::AlternativeCastDecision;
 use crate::types::card::LayoutKind;
@@ -15240,19 +15240,68 @@ pub(super) fn find_battlefield_exile_cost(cost: &AbilityCost) -> Option<(u32, &T
     }
 }
 
+/// Sole detector for a non-self "discard from hand" cost leg. Returns the count
+/// expression, optional card filter, and the `CardSelectionMode` (player-chosen
+/// vs. game-selected) so a single authority drives both the casting/activation
+/// resolver and the mana-ability path. `SourceCard` "discard this card" is never
+/// matched (see [`resolve_non_self_discard_requirement`]); recurses `Composite`.
 pub(crate) fn find_non_self_discard(
     cost: &AbilityCost,
-) -> Option<(&QuantityExpr, Option<&TargetFilter>)> {
+) -> Option<(&QuantityExpr, Option<&TargetFilter>, CardSelectionMode)> {
     match cost {
         AbilityCost::Discard {
             count,
             filter,
             self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-            ..
-        } => Some((count, filter.as_ref())),
+            selection,
+        } => Some((count, filter.as_ref(), *selection)),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_discard),
         _ => None,
     }
+}
+
+/// CR 601.2h + CR 701.9a: Resolve a non-self "discard" cost leg into its interactive requirement.
+///
+/// - `Ok(None)`  => there is no `FromHand` discard leg, OR the resolved count is 0. A zero-card
+///   discard — e.g. Lion's Eye Diamond's "Discard your hand" with an empty hand (its
+///   `HandSize` count resolves to 0) — is paid by doing nothing: nothing moves and no
+///   `Discarded`/`ZoneChanged` event fires (CR 701.9a moves cards hand→graveyard only when
+///   there are cards). Per CR 601.2h an unpayable cost can't be paid, but a zero-cost is not
+///   unpayable — it is trivially paid. The caller treats the leg as satisfied and proceeds to
+///   the next unpaid leg. Structural precedent: `mana_abilities::exile_cost_choice` (the
+///   interactive non-self cost sibling).
+/// - `Err(..)`   => there are fewer eligible cards than the required (nonzero) count, so
+///   CR 601.2h makes the cost unpayable.
+/// - `Ok(Some((count, eligible)))` => an interactive selection of `count` cards from `eligible`.
+///
+/// Detection is `FromHand`-only (via [`find_non_self_discard`]); a `SourceCard` "discard this
+/// card" cost is never matched here and its `count` resolves to 1, so it can never misfire
+/// through the zero-count auto-pay path.
+pub(crate) fn resolve_non_self_discard_requirement(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &AbilityCost,
+) -> Result<Option<(usize, Vec<ObjectId>)>, EngineError> {
+    // The activation/casting path handles ANY `FromHand` discard selection mode; the
+    // mana-ability path (see `mana_abilities::discard_cost_choice`) is the only caller
+    // that gates on `Chosen`. Keep this resolver selection-agnostic.
+    let Some((count, filter, _selection)) = find_non_self_discard(cost) else {
+        return Ok(None);
+    };
+    let count = super::quantity::resolve_quantity(state, count, player, source_id).max(0) as usize;
+    // CR 601.2h + CR 701.9a: A resolved zero-card discard is paid by doing nothing — never
+    // surface a dead selection prompt for it.
+    if count == 0 {
+        return Ok(None);
+    }
+    let eligible = find_eligible_discard_targets(state, player, source_id, filter);
+    if eligible.len() < count {
+        return Err(EngineError::ActionNotAllowed(
+            "Not enough cards in hand to discard".into(),
+        ));
+    }
+    Ok(Some((count, eligible)))
 }
 
 fn has_self_ref_discard_cost(cost: &AbilityCost) -> bool {
@@ -16971,15 +17020,13 @@ pub fn handle_activate_ability(
             });
         }
 
-        if let Some((count, filter)) = find_non_self_discard(cost) {
-            let count =
-                super::quantity::resolve_quantity(state, count, player, source_id).max(0) as usize;
-            let eligible = find_eligible_discard_targets(state, player, source_id, filter);
-            if eligible.len() < count {
-                return Err(EngineError::ActionNotAllowed(
-                    "Not enough cards in hand to discard".into(),
-                ));
-            }
+        // CR 601.2h + CR 701.9a: A resolved zero-card FromHand discard leg (e.g. Bomat
+        // Courier's "Discard your hand" on an empty hand) is paid by doing nothing — the
+        // helper returns `Ok(None)` so we FALL THROUGH to the following cost detection
+        // rather than surfacing a dead `PayCost { count: 0 }`.
+        if let Some((count, eligible)) =
+            resolve_non_self_discard_requirement(state, player, source_id, cost)?
+        {
             let mut pending_discard =
                 PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
             pending_discard.activation_cost = Some(cost.clone());
