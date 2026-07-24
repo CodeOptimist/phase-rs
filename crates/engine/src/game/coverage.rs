@@ -12185,6 +12185,7 @@ mod tests {
                     source_controller: None,
                     source_object: None,
                     bypass_beneficiary: None,
+                    protection_does_not_remove: None,
                 }],
                 duration: Some(Duration::UntilEndOfTurn),
                 target: None,
@@ -12232,6 +12233,7 @@ mod tests {
                     source_controller: None,
                     source_object: None,
                     bypass_beneficiary: None,
+                    protection_does_not_remove: None,
                 }],
                 duration: Some(Duration::UntilEndOfTurn),
                 target: None,
@@ -13367,6 +13369,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         assert!(audit_card_lines(oracle, &face).is_empty());
@@ -13401,6 +13404,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         assert!(audit_card_lines(oracle, &face).is_empty());
@@ -13433,6 +13437,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         let findings = audit_card_lines(oracle, &face);
@@ -13583,6 +13588,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         assert!(
@@ -13615,6 +13621,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         assert!(
@@ -13657,6 +13664,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -13690,6 +13698,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -13725,6 +13734,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -13766,6 +13776,7 @@ mod tests {
                 source_controller: None,
                 source_object: None,
                 bypass_beneficiary: None,
+                protection_does_not_remove: None,
             });
         }
 
@@ -13934,6 +13945,7 @@ mod tests {
             source_controller: None,
             source_object: None,
             bypass_beneficiary: None,
+            protection_does_not_remove: None,
         });
 
         assert!(
