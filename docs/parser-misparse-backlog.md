@@ -985,7 +985,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Feed the Infection
 - Festival
 - Feudkiller's Verdict
-- Fevered Visions
 - Fiery Encore
 - Fight for the Throne
 - Filigree Fracture
