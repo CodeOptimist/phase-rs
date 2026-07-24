@@ -989,10 +989,18 @@ impl<'a> CardBuilder<'a> {
 
     pub fn as_enchantment(&mut self) -> &mut Self {
         let obj = self.obj();
-        obj.card_types
-            .core_types
-            .retain(|t| *t != CoreType::Creature);
-        obj.card_types.core_types.push(CoreType::Enchantment);
+        // Permanent enchantment spells staged from `add_spell_to_hand` keep the
+        // Instant/Sorcery seed until stripped here — same shape as
+        // `as_creature` / `as_planeswalker_with_loyalty`.
+        obj.card_types.core_types.retain(|t| {
+            !matches!(
+                t,
+                CoreType::Creature | CoreType::Instant | CoreType::Sorcery
+            )
+        });
+        if !obj.card_types.core_types.contains(&CoreType::Enchantment) {
+            obj.card_types.core_types.push(CoreType::Enchantment);
+        }
         self.sync_base_card_types();
         self
     }
@@ -3341,6 +3349,9 @@ fn drive_resolution(
                 )?;
             }
             WaitingFor::CopyTargetChoice { valid_targets, .. } => {
+                // No pick declared → halt so the caller can assert the offered
+                // options and the prompt boundary via `final_waiting_for()`
+                // (mirrors SpellbookDraft / NamedChoice / ReplacementChoice).
                 let Some(target) = policy.copy_target else {
                     break;
                 };
