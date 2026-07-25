@@ -4605,6 +4605,17 @@ fn expand_granted_triggered_abilities(
 /// consults it too, so a display projection can never claim an effect is live
 /// after the layer engine has stopped applying it.
 pub(crate) fn transient_effect_is_live(state: &GameState, tce: &TransientContinuousEffect) -> bool {
+    // CR 400.7: a recipient that has changed zones is a new object, so a
+    // continuous effect tied to its prior incarnation cannot keep applying.
+    if let Some(recipient) = tce.affected_recipient {
+        if !state
+            .objects
+            .get(&recipient.object_id)
+            .is_some_and(|object| ObjectIncarnationRef::from_object(object) == recipient)
+        {
+            return false;
+        }
+    }
     // UntilHostLeavesPlay: skip if source is no longer on the battlefield
     if tce.duration == Duration::UntilHostLeavesPlay
         && !state
@@ -13803,6 +13814,7 @@ mod tests {
                     condition: StaticCondition::SourceIsTapped,
                 },
                 affected: TargetFilter::SelfRef,
+                affected_recipient: None,
                 modifications: vec![ContinuousModification::AddKeyword {
                     keyword: Keyword::Flying,
                 }],
@@ -13835,6 +13847,7 @@ mod tests {
                     condition: StaticCondition::SourceIsTapped,
                 },
                 affected: TargetFilter::SelfRef,
+                affected_recipient: None,
                 modifications: vec![ContinuousModification::AddKeyword {
                     keyword: Keyword::Flying,
                 }],
