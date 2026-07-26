@@ -1068,10 +1068,12 @@ async fn serve() {
 
     // A single-user instance has no other players whose seats a grace period
     // would free, so reconnects never expire — a game suspended for any length
-    // of time stays resumable. `with_grace_period` sets the reconnect window;
+    // of time stays resumable. `single_user` sets the reconnect window;
     // ten years is effectively unbounded without risking overflow in `now + grace`.
+    // It also stamps `HostingMode::SingleUser` on every session this manager
+    // owns, which is what grants the desktop sidecar its debug capability.
     let state: SharedState = Arc::new(Mutex::new(if cli.single_user {
-        SessionManager::with_grace_period(Duration::from_secs(10 * 365 * 24 * 60 * 60))
+        SessionManager::single_user(Duration::from_secs(10 * 365 * 24 * 60 * 60))
     } else {
         SessionManager::new()
     }));
@@ -5428,7 +5430,21 @@ async fn handle_client_message(
 
             match outcome {
                 Err(reason) => {
-                    let msg = ServerMessage::error(reason);
+                    // A refused takeback is a benign rejection, not a
+                    // transport error: "there is no previous action of yours
+                    // to take back", "a takeback request is already pending",
+                    // "only human players may request a takeback". Answer on
+                    // the same channel the sibling `ClientMessage::Action`
+                    // handler uses for a rejected action.
+                    //
+                    // `ServerMessage::error` is read by the native client as a
+                    // terminal socket failure: `handleNativeEvent` disposes the
+                    // adapter on ANY `error` event and GamePage then sets
+                    // `reconnectState: "failed"`, leaving the desktop session
+                    // unrecoverable. Reaching for the error channel here was
+                    // this handler's inconsistency with its own sibling ~2,400
+                    // lines above, not a deliberate signal.
+                    let msg = ServerMessage::ActionRejected { reason };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let _ = socket.send(Message::text(json)).await;
                     }
@@ -5500,7 +5516,13 @@ async fn handle_client_message(
 
             match outcome {
                 Err(reason) => {
-                    let msg = ServerMessage::error(reason);
+                    // Same classification as the `RequestTakeback` arm above:
+                    // "there is no pending takeback request" and "only human
+                    // players may respond" are refusals, not socket failures.
+                    // Fixed here too so the pair stays consistent — a benign
+                    // refusal must never travel the channel the native client
+                    // treats as terminal.
+                    let msg = ServerMessage::ActionRejected { reason };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let _ = socket.send(Message::text(json)).await;
                     }
@@ -5561,7 +5583,15 @@ async fn handle_client_message(
 
             match result {
                 Err(reason) => {
-                    let msg = ServerMessage::error(reason);
+                    // The third member of the same class as the two arms
+                    // above: `cancel_takeback`'s only failures are benign
+                    // refusals ("only the player who requested the takeback
+                    // may cancel it", "there is no pending takeback
+                    // request"). Answer on the rejection channel, not the
+                    // terminal error channel — `handleNativeEvent` disposes
+                    // the adapter on ANY `error` event, so a mis-clicked
+                    // cancel would end the desktop session.
+                    let msg = ServerMessage::ActionRejected { reason };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let _ = socket.send(Message::text(json)).await;
                     }
