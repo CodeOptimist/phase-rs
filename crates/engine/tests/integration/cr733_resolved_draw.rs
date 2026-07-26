@@ -44,6 +44,21 @@ fn apply_semantic_command(state: &mut GameState, command: &ResolvedRulesCommand)
         ResolvedRulesCommand::ObjectTransform(command) => {
             engine::game::transform::apply_resolved_transform(state, command).unwrap();
         }
+        ResolvedRulesCommand::Attachment(command) => {
+            engine::game::effects::attach::apply_resolved_attachment(state, command).unwrap();
+        }
+        ResolvedRulesCommand::ControllerOverride(command) => {
+            engine::game::zones::apply_resolved_controller_override(state, command).unwrap();
+        }
+        ResolvedRulesCommand::EntryProvenance(command) => {
+            engine::game::zones::apply_resolved_entry_provenance(state, command).unwrap();
+        }
+        ResolvedRulesCommand::ObjectCease(command) => {
+            engine::game::zones::apply_resolved_object_cease(state, command).unwrap();
+        }
+        ResolvedRulesCommand::PlayerLeave(command) => {
+            engine::game::elimination::apply_resolved_player_leave(state, command).unwrap();
+        }
         ResolvedRulesCommand::LedgerEdit(command) => {
             engine::game::ledger::apply_resolved_ledger_edit(state, command).unwrap();
         }
