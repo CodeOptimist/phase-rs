@@ -16,7 +16,8 @@ use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::{
     ResolvedStackEntryFinalizeCommand, ResolvedStackEntryFinalizeReplayInvariantError,
-    ResolvedStackPushCommand, ResolvedStackPushOrigin, ResolvedStackPushReplayInvariantError,
+    ResolvedStackPopCommand, ResolvedStackPopReplayInvariantError, ResolvedStackPushCommand,
+    ResolvedStackPushOrigin, ResolvedStackPushReplayInvariantError,
     ResolvedUncommittedTriggerRemovalCommand,
     ResolvedUncommittedTriggerRemovalReplayInvariantError,
 };
@@ -266,6 +267,96 @@ pub fn apply_resolved_stack_entry_finalize(
         command.object,
         command.resulting_paid_facts.as_ref().clone(),
     );
+    Ok(())
+}
+
+/// Everything one stack removal settles: the entry plus the per-entry side-table
+/// rows keyed on it.
+///
+/// The rows are returned rather than discarded because the resolution pop
+/// consumes both — the paid snapshot feeds cost-dependent resolution and the
+/// batch feeds CR 603.7c event context. Callers that only need the entry drop
+/// the rest.
+pub(crate) struct PoppedStackEntry {
+    pub entry: StackEntry,
+    pub paid_facts: Option<StackPaidSnapshot>,
+    pub trigger_event_batch: Option<Vec<GameEvent>>,
+}
+
+/// CR 405.2: removes the topmost object from the stack.
+///
+/// The single authority for the ordinary top-of-stack removal — the CR 405.5
+/// resolution pop and the drain loops that clear several entries in one pass
+/// (batched resolution, inert no-op batches, CR 724.1b stack exile). Each call
+/// removes exactly one object, so a drain of N entries is N removals rather
+/// than one bulk mutation.
+///
+/// Both side tables are dropped here rather than by the callers because they are
+/// keyed on the entry and settle WITH the pop: a removal that dropped the entry
+/// but left `stack_paid_facts` or `stack_trigger_event_batches` behind would
+/// strand rows against an id no longer on the stack.
+///
+/// NOT used by [`pop_uncommitted_pending_trigger_entry`], which performs the
+/// same three-line mutation. That is deliberate: the CR 603.3d removal is a
+/// distinct family with its own record, and routing it through this authority
+/// would journal one mutation twice, so a replay would pop two entries where
+/// execution popped one.
+pub(crate) fn pop_top_stack_entry(state: &mut GameState) -> Option<PoppedStackEntry> {
+    let entry = state.stack.pop_back()?;
+    let paid_facts = state.stack_paid_facts.remove(&entry.id);
+    let trigger_event_batch = state.stack_trigger_event_batches.remove(&entry.id);
+
+    // CR 733: journal once ALL THREE removals have settled, so the record
+    // describes a stack the entry has already left. An empty stack is the one
+    // case that journals nothing — `?` returns above, because no mutation
+    // happened at all.
+    let cause = state.current_or_begin_rules_execution_node();
+    state
+        .resolved_rules_journal
+        .record_stack_pop(ResolvedStackPopCommand {
+            entry: Box::new(entry.clone()),
+            resulting_depth: state.stack.len(),
+            cause,
+        })
+        .expect("resolved stack pop must have a live journal cause");
+
+    Some(PoppedStackEntry {
+        entry,
+        paid_facts,
+        trigger_event_batch,
+    })
+}
+
+/// Replays one already-resolved CR 405.2 stack pop.
+///
+/// Installs the recorded removal with nothing re-derived: the entry to remove is
+/// verified against the record rather than located by a fresh scan. Both
+/// preconditions are checked BEFORE any mutation, so a rejected replay leaves
+/// the stack and both side tables untouched.
+pub fn apply_resolved_stack_pop(
+    state: &mut GameState,
+    command: &ResolvedStackPopCommand,
+) -> Result<(), ResolvedStackPopReplayInvariantError> {
+    // CR 405.2: the predecessor must be exactly one deeper than the record.
+    let expected_depth = command.resulting_depth + 1;
+    if state.stack.len() != expected_depth {
+        return Err(ResolvedStackPopReplayInvariantError::DepthMismatch {
+            expected: expected_depth,
+            found: state.stack.len(),
+        });
+    }
+    // Compared WHOLE rather than by id: an applier that matched on `id` alone
+    // would discard a divergent object that merely reused the identifier.
+    if state.stack.back() != Some(command.entry.as_ref()) {
+        return Err(ResolvedStackPopReplayInvariantError::PoppedEntryMismatch);
+    }
+
+    let entry = state
+        .stack
+        .pop_back()
+        .expect("the entry was just verified at the top of the stack");
+    state.stack_paid_facts.remove(&entry.id);
+    state.stack_trigger_event_batches.remove(&entry.id);
     Ok(())
 }
 
@@ -667,11 +758,14 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.announced_source_x = None;
 
     // CR 405.5: When all players pass in succession, the top object on the stack resolves.
-    let entry = match state.stack.pop_back() {
-        Some(e) => e,
-        None => return,
+    let Some(PoppedStackEntry {
+        entry,
+        paid_facts: paid_snapshot,
+        trigger_event_batch,
+    }) = pop_top_stack_entry(state)
+    else {
+        return;
     };
-    let paid_snapshot = state.stack_paid_facts.remove(&entry.id);
 
     // CR 113.3b: Activated keyword abilities (Equip / Crew / Saddle / Station)
     // resolve via their typed payload — they have no ResolvedAbility/targets
@@ -685,8 +779,6 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         });
         return;
     }
-
-    let trigger_event_batch = state.stack_trigger_event_batches.remove(&entry.id);
 
     // CR 603.4: Intervening-if condition rechecked at resolution time.
     if let StackEntryKind::TriggeredAbility {
@@ -3145,18 +3237,15 @@ fn resolve_batched(
     // CR 400.7j: clear the resolution-scoped self-move re-latch with the entry.
     state.resolution_source_relatch = None;
 
-    // Pop the run's entries (resolution order is back-to-front), cleaning the
-    // per-entry side tables exactly as `resolve_top` does for a single entry.
+    // Pop the run's entries (resolution order is back-to-front) through the same
+    // authority `resolve_top` uses for a single entry, so the per-entry side
+    // tables settle with each removal.
     let mut popped = Vec::with_capacity(consumed as usize);
     for _ in 0..consumed {
-        match state.stack.pop_back() {
-            Some(entry) => {
-                state.stack_paid_facts.remove(&entry.id);
-                state.stack_trigger_event_batches.remove(&entry.id);
-                popped.push(entry);
-            }
-            None => break,
-        }
+        let Some(removed) = pop_top_stack_entry(state) else {
+            break;
+        };
+        popped.push(removed.entry);
     }
 
     // CR 603.7c: Set the trigger event context once from the (identical) top
@@ -3482,13 +3571,11 @@ fn resolve_inert_noop_batch(
     // CR 400.7j: clear the resolution-scoped self-move re-latch with the entry.
     state.resolution_source_relatch = None;
     for _ in 0..consumed {
-        let Some(entry) = state.stack.pop_back() else {
+        let Some(removed) = pop_top_stack_entry(state) else {
             break;
         };
-        state.stack_paid_facts.remove(&entry.id);
-        state.stack_trigger_event_batches.remove(&entry.id);
         events.push(GameEvent::StackResolved {
-            object_id: entry.id,
+            object_id: removed.entry.id,
         });
     }
     consumed
