@@ -13042,6 +13042,7 @@ mod tests {
             player_id: PlayerId(1),
             action: crate::types::events::PlayerActionKind::SearchedLibrary,
             look_count: None,
+            scry_bottom_count: None,
         });
         let ability = ResolvedAbility::new(
             Effect::Draw {
@@ -14126,6 +14127,7 @@ mod tests {
             Effect::ExileTop {
                 count: QuantityExpr::Fixed { value: 2 },
                 player: TargetFilter::Controller,
+                position: crate::types::ability::LibraryPosition::Top,
                 face_down: false,
             },
             vec![],
@@ -19284,6 +19286,7 @@ mod tests {
             Effect::ExileTop {
                 player: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: 1 },
+                position: crate::types::ability::LibraryPosition::Top,
                 face_down: false,
             },
             vec![],
@@ -19368,6 +19371,7 @@ mod tests {
             Effect::ExileTop {
                 player: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: 1 },
+                position: crate::types::ability::LibraryPosition::Top,
                 face_down: false,
             },
             vec![],
@@ -22632,6 +22636,7 @@ mod tests {
             Effect::ExileTop {
                 player: TargetFilter::Controller,
                 count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                position: crate::types::ability::LibraryPosition::Top,
                 face_down: false,
             },
             vec![],
