@@ -2880,6 +2880,7 @@ fn incubator_ability() -> AbilityDefinition {
         AbilityKind::Activated,
         Effect::Transform {
             target: TargetFilter::SelfRef,
+            scope: crate::types::ability::EffectScope::Single,
         },
     )
     .cost(AbilityCost::Mana {
@@ -4162,7 +4163,8 @@ mod tests {
         assert!(matches!(
             *abilities[0].effect,
             Effect::Transform {
-                target: TargetFilter::SelfRef
+                target: TargetFilter::SelfRef,
+                ..
             }
         ));
         assert!(matches!(
