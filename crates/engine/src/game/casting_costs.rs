@@ -1946,7 +1946,7 @@ fn finish_selected_return_to_hand_after_automatic(
             player,
             pending.object_id,
             &cost,
-            super::casting::activation_ability_tag(state, pending.object_id, ability_index),
+            Some(ability_index),
             events,
         )? {
             super::casting::PaymentOutcome::Paid => {}
@@ -2175,7 +2175,7 @@ pub(crate) fn handle_activation_cost_one_of_choice(
         player,
         pending.object_id,
         chosen_cost,
-        pending.ability.context.ability_tag,
+        pending.activation_ability_index,
     ) {
         return Err(EngineError::ActionNotAllowed(
             "Chosen cost branch is not payable".to_string(),
@@ -3044,7 +3044,7 @@ pub(crate) fn handle_return_to_hand_for_cost(
                     player,
                     pending.object_id,
                     &cost,
-                    super::casting::activation_ability_tag(state, pending.object_id, ability_index),
+                    Some(ability_index),
                     events,
                 )? {
                     super::casting::PaymentOutcome::Paid => {}
@@ -3209,14 +3209,12 @@ pub(crate) fn handle_remove_counter_for_cost(
             // pay the automatic residual through the outcome-aware authority.
             // If a self-move pauses, the typed continuation resumes this pending
             // activation only after the selected counter was paid exactly once.
-            let ability_tag =
-                super::casting::activation_ability_tag(state, pending.object_id, ability_index);
             match super::casting::pay_ability_cost_for_activation(
                 state,
                 player,
                 pending.object_id,
                 &cost,
-                ability_tag,
+                Some(ability_index),
                 events,
             )? {
                 super::casting::PaymentOutcome::Paid => {}
@@ -3383,14 +3381,12 @@ pub(crate) fn handle_remove_counter_distribution_for_cost(
             // CR 601.2h + CR 602.2b: The assigned counter payment is complete
             // before an automatic residual can pause on a self-move replacement,
             // so its typed continuation cannot replay the selected distribution.
-            let ability_tag =
-                super::casting::activation_ability_tag(state, pending.object_id, ability_index);
             match super::casting::pay_ability_cost_for_activation(
                 state,
                 player,
                 pending.object_id,
                 &cost,
-                ability_tag,
+                Some(ability_index),
                 events,
             )? {
                 super::casting::PaymentOutcome::Paid => {}
@@ -4451,7 +4447,7 @@ pub(super) fn push_activated_ability_to_stack(
                 player,
                 source_id,
                 cost,
-                super::casting::activation_ability_tag(state, source_id, ability_index),
+                Some(ability_index),
                 events,
             )?
         {
@@ -9503,10 +9499,27 @@ fn option_satisfies(
     if acceptable.is_empty() {
         return true;
     }
-    match &opt.atomic_combination {
-        Some(combo) => combo.iter().any(|t| acceptable.contains(t)),
-        None => acceptable.contains(&opt.mana_type),
-    }
+    option_mana_types_for_context(opt, payment_context)
+        .iter()
+        .any(|mana_type| acceptable.contains(mana_type))
+}
+
+/// Mana this source may contribute to the pending payment. An activation
+/// color rider restricts mana that is spent, not the mana ability itself: an
+/// off-color byproduct from a multi-output source remains in the pool.
+fn option_mana_types_for_context(
+    opt: &ManaSourceOption,
+    payment_context: Option<&PaymentContext<'_>>,
+) -> Vec<ManaType> {
+    opt.atomic_combination
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(&opt.mana_type))
+        .iter()
+        .copied()
+        .filter(|mana_type| {
+            payment_context.is_none_or(|ctx| ctx.permits_actual_mana_type(*mana_type))
+        })
+        .collect()
 }
 
 fn option_allowed_for_context(
@@ -10238,16 +10251,13 @@ fn auto_tap_mana_sources_inner(
             if generic_priority(option) != class {
                 continue;
             }
-            if !option_allowed_for_context(option, effective_ctx) {
+            let eligible_width = option_mana_types_for_context(option, effective_ctx).len();
+            if !option_allowed_for_context(option, effective_ctx) || eligible_width == 0 {
                 continue;
             }
             if used_sources.insert(option.object_id) {
-                let width = option
-                    .atomic_combination
-                    .as_ref()
-                    .map_or(1, |combo| combo.len());
                 to_tap.push(option.clone());
-                remaining_generic = remaining_generic.saturating_sub(width);
+                remaining_generic = remaining_generic.saturating_sub(eligible_width);
             }
         }
     }
@@ -10335,13 +10345,12 @@ fn auto_tap_mana_sources_inner(
                     excluded_sources
                 };
                 if let Some(sub_cost) = sub_cost {
-                    let (source_types, source_subtypes) =
-                        super::casting::activation_source_types(state, option.object_id);
-                    let activation_ctx = PaymentContext::Activation {
-                        source_types: &source_types,
-                        source_subtypes: &source_subtypes,
-                        ability_tag: ability_def.ability_tag,
-                    };
+                    let activation_context = super::casting::activation_payment_context(
+                        state,
+                        option.object_id,
+                        Some(idx),
+                    );
+                    let activation_ctx = activation_context.as_payment_context();
                     auto_tap_mana_sources_inner(
                         state,
                         player,
@@ -10548,11 +10557,11 @@ fn assign_combination_sources(
         let mut best_score = 0usize;
         let mut best_combo: Option<(&ManaSourceOption, Vec<usize>)> = None;
         for cand in &candidates {
-            let combo = cand
-                .atomic_combination
-                .as_ref()
-                .expect("combination row invariant");
-            let (score, covered) = score_combination(combo, needs, assigned);
+            let combo = option_mana_types_for_context(cand, payment_context);
+            if combo.is_empty() {
+                continue;
+            }
+            let (score, covered) = score_combination(&combo, needs, assigned);
             if score > best_score {
                 best_score = score;
                 best_combo = Some((cand, covered));
@@ -11234,17 +11243,9 @@ fn finalize_mana_payment_with_resume(
                     )
                 })
                 .unwrap_or_default();
-            let (source_types, source_subtypes) =
-                super::casting::activation_source_types(state, source_id);
-            let activation_ctx = PaymentContext::Activation {
-                source_types: &source_types,
-                source_subtypes: &source_subtypes,
-                ability_tag: super::casting::activation_ability_tag(
-                    state,
-                    source_id,
-                    ability_index,
-                ),
-            };
+            let activation_context =
+                super::casting::activation_payment_context(state, source_id, Some(ability_index));
+            let activation_ctx = activation_context.as_payment_context();
             if let Some(waiting) = maybe_pause_for_phyrexian_choice(
                 state,
                 player,
@@ -11305,8 +11306,8 @@ fn finalize_mana_payment_with_resume(
                 state,
                 player,
                 pending.object_id,
+                Some(ability_index),
                 &pending.cost,
-                super::casting::activation_ability_tag(state, pending.object_id, ability_index),
                 None,
                 events,
                 &excluded_sources,
@@ -11630,8 +11631,8 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
                 state,
                 player,
                 pending.object_id,
+                Some(ability_index),
                 &pending.cost,
-                super::casting::activation_ability_tag(state, pending.object_id, ability_index),
                 Some(phyrexian_choices),
                 events,
                 &excluded_sources,
