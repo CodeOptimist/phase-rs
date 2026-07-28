@@ -14192,6 +14192,7 @@ pub(super) fn pay_mana_cost(
 /// CR 107.4f + CR 601.2f: Pay a spell's mana cost, honoring explicit per-shard
 /// Phyrexian choices when provided. `None` preserves the legacy auto-decide
 /// behavior (prefer mana, fall back to life).
+#[cfg(test)]
 pub(super) fn pay_mana_cost_with_choices(
     state: &mut GameState,
     player: PlayerId,
@@ -14200,7 +14201,7 @@ pub(super) fn pay_mana_cost_with_choices(
     phyrexian_choices: Option<&[crate::types::game_state::ShardChoice]>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
-    pay_mana_cost_with_choices_and_resume(
+    match pay_mana_cost_with_choices_and_resume(
         state,
         player,
         source_id,
@@ -14208,7 +14209,58 @@ pub(super) fn pay_mana_cost_with_choices(
         phyrexian_choices,
         None,
         events,
-    )
+    )? {
+        ManaCostPayment::Paid(()) => Ok(()),
+        ManaCostPayment::Paused { .. } => Err(EngineError::InvalidAction(
+            "Mana payment is awaiting a replacement continuation".to_string(),
+        )),
+    }
+}
+
+/// CR 107.4f + CR 118.3b + CR 119.4 + CR 616.1: A mana payment may have
+/// committed its mana and one Phyrexian life component while that life event's
+/// replacement post-effect remains interactive. The caller owns the exact
+/// outer continuation and receives every still-unpaid life component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ManaCostPayment<T> {
+    Paid(T),
+    Paused {
+        value: T,
+        remaining_life_payments: Vec<u32>,
+    },
+}
+
+/// CR 107.4f + CR 118.3b + CR 119.4 + CR 616.1: Pay the selected life
+/// components in order and return the suffix that remains after either kind of
+/// replacement pause. The caller owns the surrounding mana-payment root.
+fn pay_life_components(
+    state: &mut GameState,
+    player: PlayerId,
+    amounts: &[u32],
+    events: &mut Vec<GameEvent>,
+    pay_life: fn(
+        &mut GameState,
+        PlayerId,
+        u32,
+        &mut Vec<GameEvent>,
+    ) -> super::life_costs::PayLifeCostResult,
+) -> Result<Option<Vec<u32>>, EngineError> {
+    for (index, amount) in amounts.iter().copied().enumerate() {
+        match pay_life(state, player, amount, events) {
+            super::life_costs::PayLifeCostResult::Paid { .. } => {}
+            super::life_costs::PayLifeCostResult::PaidWithDeferredSubstitution { .. }
+            | super::life_costs::PayLifeCostResult::DeferredReplacementChoice { .. } => {
+                return Ok(Some(amounts[index + 1..].to_vec()));
+            }
+            super::life_costs::PayLifeCostResult::InsufficientLife
+            | super::life_costs::PayLifeCostResult::Prohibited => {
+                return Err(EngineError::ActionNotAllowed(
+                    "Cannot pay Phyrexian life cost".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// CR 107.4f + CR 601.2f-h + CR 605.3b + CR 616.1: A submitted Phyrexian
@@ -14222,13 +14274,13 @@ pub(super) fn pay_mana_cost_with_choices_and_resume(
     phyrexian_choices: Option<&[crate::types::game_state::ShardChoice]>,
     resume: Option<&ManaAbilityResume>,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     super::layers::flush_layers(state);
 
     let spell_meta = build_spell_meta(state, player, source_id);
     let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
 
-    let spent_units = auto_tap_and_pay_cost(
+    let payment = auto_tap_and_pay_cost(
         state,
         player,
         source_id,
@@ -14238,6 +14290,13 @@ pub(super) fn pay_mana_cost_with_choices_and_resume(
         events,
         resume,
     )?;
+    let (spent_units, remaining_life_payments) = match payment {
+        ManaCostPayment::Paid(spent_units) => (spent_units, None),
+        ManaCostPayment::Paused {
+            value,
+            remaining_life_payments,
+        } => (value, Some(remaining_life_payments)),
+    };
 
     let spent_convoke_sources = spent_units
         .iter()
@@ -14292,7 +14351,13 @@ pub(super) fn pay_mana_cost_with_choices_and_resume(
         }
     }
 
-    Ok(())
+    Ok(match remaining_life_payments {
+        Some(remaining_life_payments) => ManaCostPayment::Paused {
+            value: (),
+            remaining_life_payments,
+        },
+        None => ManaCostPayment::Paid(()),
+    })
 }
 
 /// CR 601.2h: Pay the locked spell mana cost from the current pool without
@@ -14304,7 +14369,7 @@ pub(super) fn pay_mana_cost_from_pool_with_choices(
     cost: &crate::types::mana::ManaCost,
     phyrexian_choices: Option<&[crate::types::game_state::ShardChoice]>,
     events: &mut Vec<GameEvent>,
-) -> Result<u32, EngineError> {
+) -> Result<ManaCostPayment<u32>, EngineError> {
     super::layers::flush_layers(state);
 
     let spell_meta = build_spell_meta(state, player, source_id);
@@ -14365,19 +14430,17 @@ pub(super) fn pay_mana_cost_from_pool_with_choices(
         state.layers_dirty.mark_full();
     }
 
-    for payment in &life_payments {
-        let amount = u32::try_from(payment.amount).unwrap_or(0);
-        match super::life_costs::pay_life_as_cast_or_activation_cost(state, player, amount, events)
-        {
-            super::life_costs::PayLifeCostResult::Paid { .. } => {}
-            super::life_costs::PayLifeCostResult::InsufficientLife
-            | super::life_costs::PayLifeCostResult::Prohibited => {
-                return Err(EngineError::ActionNotAllowed(
-                    "Cannot pay Phyrexian life cost".to_string(),
-                ));
-            }
-        }
-    }
+    let life_amounts = life_payments
+        .iter()
+        .map(|payment| u32::try_from(payment.amount).unwrap_or(0))
+        .collect::<Vec<_>>();
+    let remaining_life_payments = pay_life_components(
+        state,
+        player,
+        &life_amounts,
+        events,
+        super::life_costs::pay_life_as_cast_or_activation_cost,
+    )?;
 
     let spent_convoke_sources = spent_units
         .iter()
@@ -14426,7 +14489,14 @@ pub(super) fn pay_mana_cost_from_pool_with_choices(
         }
     }
 
-    Ok(mana_spent_units.len() as u32)
+    let actual_mana_spent = mana_spent_units.len() as u32;
+    Ok(match remaining_life_payments {
+        Some(remaining_life_payments) => ManaCostPayment::Paused {
+            value: actual_mana_spent,
+            remaining_life_payments,
+        },
+        None => ManaCostPayment::Paid(actual_mana_spent),
+    })
 }
 
 fn cleanup_unused_convoke_payments(
@@ -14505,7 +14575,7 @@ pub(super) fn pay_ability_mana_cost(
     ability_index: Option<usize>,
     cost: &crate::types::mana::ManaCost,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     pay_ability_mana_cost_excluding(
         state,
         player,
@@ -14532,7 +14602,7 @@ pub(super) fn pay_ability_mana_cost_excluding(
     // demand is threaded so the sub-cost's generic pips are funded from
     // non-demanded mana. `None` for ordinary top-level ability activations.
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     pay_ability_mana_cost_excluding_with_parent(
         state,
         player,
@@ -14559,7 +14629,7 @@ pub(super) fn pay_ability_mana_cost_excluding_with_parent(
     excluded_sources: &HashSet<ObjectId>,
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
     parent: Option<&ManaAbilityCostParent>,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     pay_ability_mana_cost_with_choices_excluding_and_parent(
         state,
         player,
@@ -14589,7 +14659,7 @@ pub(super) fn pay_ability_mana_cost_with_choices_excluding_and_resume(
     excluded_sources: &HashSet<ObjectId>,
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
     resume: &ManaAbilityResume,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     pay_ability_mana_cost_with_choices_excluding_and_parent(
         state,
         player,
@@ -14618,13 +14688,13 @@ fn pay_ability_mana_cost_with_choices_excluding_and_parent(
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
     resume: Option<&ManaAbilityResume>,
     parent: Option<&ManaAbilityCostParent>,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     super::layers::flush_layers(state);
 
     let activation_context = activation_payment_context(state, source_id, ability_index);
     let activation_ctx = activation_context.as_payment_context();
 
-    let _spent_units = auto_tap_and_pay_cost_excluding(
+    let payment = auto_tap_and_pay_cost_excluding(
         state,
         player,
         source_id,
@@ -14638,7 +14708,16 @@ fn pay_ability_mana_cost_with_choices_excluding_and_parent(
         parent,
     )?;
 
-    Ok(())
+    Ok(match payment {
+        ManaCostPayment::Paid(_) => ManaCostPayment::Paid(()),
+        ManaCostPayment::Paused {
+            remaining_life_payments,
+            ..
+        } => ManaCostPayment::Paused {
+            value: (),
+            remaining_life_payments,
+        },
+    })
 }
 
 /// Pay a mana cost during effect resolution. Resolution-time "you may pay"
@@ -14665,7 +14744,8 @@ pub(super) fn pay_effect_mana_cost_with_resume(
     resume: Option<&ManaAbilityResume>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
-    pay_non_cast_mana_cost(
+    let resume_at_resolution_depth = state.resolution_stack.len();
+    match pay_non_cast_mana_cost(
         state,
         player,
         Some(source_id),
@@ -14673,7 +14753,29 @@ pub(super) fn pay_effect_mana_cost_with_resume(
         PaymentContext::Effect,
         resume,
         events,
-    )
+    )? {
+        ManaCostPayment::Paid(()) => Ok(()),
+        ManaCostPayment::Paused {
+            remaining_life_payments,
+            ..
+        } => {
+            let Some(resume) = resume.cloned() else {
+                return Err(EngineError::InvalidAction(
+                    "Deferred life payment has no outer resolution root".to_string(),
+                ));
+            };
+            state.pending_deferred_life_cost_resume =
+                Some(crate::types::game_state::DeferredLifeCostResume::ManaRoot {
+                    player,
+                    resume: Box::new(resume),
+                    remaining_life_payments,
+                    resume_at_resolution_depth,
+                });
+            Err(EngineError::InvalidAction(
+                "Mana payment is awaiting a replacement continuation".to_string(),
+            ))
+        }
+    }
 }
 
 /// The result of a special-action mana payment attempt. A paused result is a
@@ -14725,6 +14827,7 @@ pub(crate) fn pay_special_action_mana_cost_with_resume(
     resume: Option<&ManaAbilityResume>,
     events: &mut Vec<GameEvent>,
 ) -> Result<SpecialActionManaPayment, EngineError> {
+    let resume_at_resolution_depth = state.resolution_stack.len();
     match pay_non_cast_mana_cost(
         state,
         player,
@@ -14734,7 +14837,25 @@ pub(crate) fn pay_special_action_mana_cost_with_resume(
         resume,
         events,
     ) {
-        Ok(()) => Ok(SpecialActionManaPayment::Paid),
+        Ok(ManaCostPayment::Paid(())) => Ok(SpecialActionManaPayment::Paid),
+        Ok(ManaCostPayment::Paused {
+            remaining_life_payments,
+            ..
+        }) => {
+            let Some(resume) = resume.cloned() else {
+                return Err(EngineError::InvalidAction(
+                    "Deferred life payment has no outer special-action root".to_string(),
+                ));
+            };
+            state.pending_deferred_life_cost_resume =
+                Some(crate::types::game_state::DeferredLifeCostResume::ManaRoot {
+                    player,
+                    resume: Box::new(resume),
+                    remaining_life_payments,
+                    resume_at_resolution_depth,
+                });
+            Ok(SpecialActionManaPayment::Paused)
+        }
         // CR 605.3b + CR 616.1: The auto-tapped source owns the live cost
         // cursor. It is an in-progress payment, not an affordability failure.
         Err(_) if mana_ability_cost_payment_is_paused(state) => {
@@ -14774,7 +14895,7 @@ fn pay_non_cast_mana_cost(
     ctx: PaymentContext<'_>,
     resume: Option<&ManaAbilityResume>,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EngineError> {
+) -> Result<ManaCostPayment<()>, EngineError> {
     super::layers::flush_layers(state);
 
     let events_before = events.len();
@@ -14846,20 +14967,25 @@ fn pay_non_cast_mana_cost(
         state.layers_dirty.mark_full();
     }
 
-    for payment in &life_payments {
-        let amount = u32::try_from(payment.amount).unwrap_or(0);
-        match super::life_costs::pay_life_as_cost(state, player, amount, events) {
-            super::life_costs::PayLifeCostResult::Paid { .. } => {}
-            super::life_costs::PayLifeCostResult::InsufficientLife
-            | super::life_costs::PayLifeCostResult::Prohibited => {
-                return Err(EngineError::ActionNotAllowed(
-                    "Cannot pay Phyrexian life cost".to_string(),
-                ));
-            }
-        }
-    }
+    let life_amounts = life_payments
+        .iter()
+        .map(|payment| u32::try_from(payment.amount).unwrap_or(0))
+        .collect::<Vec<_>>();
+    let remaining_life_payments = pay_life_components(
+        state,
+        player,
+        &life_amounts,
+        events,
+        super::life_costs::pay_life_as_cost,
+    )?;
 
-    Ok(())
+    Ok(match remaining_life_payments {
+        Some(remaining_life_payments) => ManaCostPayment::Paused {
+            value: (),
+            remaining_life_payments,
+        },
+        None => ManaCostPayment::Paid(()),
+    })
 }
 
 /// Shared mana-payment core: auto-taps sources, validates affordability,
@@ -14876,7 +15002,7 @@ fn auto_tap_and_pay_cost(
     phyrexian_choices: Option<&[crate::types::game_state::ShardChoice]>,
     events: &mut Vec<GameEvent>,
     resume: Option<&ManaAbilityResume>,
-) -> Result<Vec<crate::types::mana::ManaUnit>, EngineError> {
+) -> Result<ManaCostPayment<Vec<crate::types::mana::ManaUnit>>, EngineError> {
     auto_tap_and_pay_cost_excluding(
         state,
         player,
@@ -14905,7 +15031,7 @@ fn auto_tap_and_pay_cost_excluding(
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
     resume: Option<&ManaAbilityResume>,
     parent: Option<&ManaAbilityCostParent>,
-) -> Result<Vec<crate::types::mana::ManaUnit>, EngineError> {
+) -> Result<ManaCostPayment<Vec<crate::types::mana::ManaUnit>>, EngineError> {
     let events_before = events.len();
     let life_colors = super::static_abilities::player_life_payment_colors(state, player);
     let tap_cost = phyrexian_choices.map_or_else(
@@ -15011,21 +15137,25 @@ fn auto_tap_and_pay_cost_excluding(
     // with life routes through the single-authority life-cost helper so the
     // deduction IS a life-loss event (replacement pipeline + CantLoseLife
     // short-circuit apply consistently).
-    for payment in &life_payments {
-        let amount = u32::try_from(payment.amount).unwrap_or(0);
-        match super::life_costs::pay_life_as_cast_or_activation_cost(state, player, amount, events)
-        {
-            super::life_costs::PayLifeCostResult::Paid { .. } => {}
-            super::life_costs::PayLifeCostResult::InsufficientLife
-            | super::life_costs::PayLifeCostResult::Prohibited => {
-                return Err(EngineError::ActionNotAllowed(
-                    "Cannot pay Phyrexian life cost".to_string(),
-                ));
-            }
-        }
-    }
+    let life_amounts = life_payments
+        .iter()
+        .map(|payment| u32::try_from(payment.amount).unwrap_or(0))
+        .collect::<Vec<_>>();
+    let remaining_life_payments = pay_life_components(
+        state,
+        player,
+        &life_amounts,
+        events,
+        super::life_costs::pay_life_as_cast_or_activation_cost,
+    )?;
 
-    Ok(spent_units)
+    Ok(match remaining_life_payments {
+        Some(remaining_life_payments) => ManaCostPayment::Paused {
+            value: spent_units,
+            remaining_life_payments,
+        },
+        None => ManaCostPayment::Paid(spent_units),
+    })
 }
 
 /// CR 601.2h + CR 602.2b + CR 605.3b + CR 616.1: A mana ability's serialized
