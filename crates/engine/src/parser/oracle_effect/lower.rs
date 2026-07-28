@@ -1631,6 +1631,50 @@ pub(super) fn change_zone_selects_battlefield_permanent(
     matches!(target, TargetFilter::Typed(_))
 }
 
+/// CR 115.10a + CR 608.2d: shared ChangeZone stack-vs-resolution classifier.
+/// `fragment_lower` must be the moved-object clause / predicate only — never a
+/// subject prefix like "Target player …", which would false-positive the
+/// `"target "` scan and force Stack.
+///
+/// Used by `target_choice_timing_for_clause` (`ChangeZone` only — mass
+/// `ChangeZoneAll` keeps the historical Stack default there) and by the
+/// `"target player" + ChangeZone/ChangeZoneAll` TargetOnly wrap (Strategic
+/// Betrayal #6505, Relic of Progenitus #6446).
+pub(super) fn change_zone_target_choice_timing(
+    origin: Option<Zone>,
+    target: &TargetFilter,
+    has_multi_target: bool,
+    fragment_lower: &str,
+) -> TargetChoiceTiming {
+    let off_battlefield_origin = origin.is_some_and(|zone| zone != Zone::Battlefield)
+        || has_multi_target
+            && target
+                .extract_zones()
+                .iter()
+                .any(|zone| *zone != Zone::Battlefield);
+    if off_battlefield_origin {
+        // Off-BF non-"target " legs (Relic: "exiles a card from their graveyard")
+        // are resolution picks; explicit "target cards …" (Memory's Journey) stay Stack.
+        if nom_primitives::scan_contains(fragment_lower, "target ") {
+            TargetChoiceTiming::Stack
+        } else {
+            TargetChoiceTiming::Resolution
+        }
+    } else if nom_primitives::scan_contains(fragment_lower, "target ") {
+        TargetChoiceTiming::Stack
+    } else if change_zone_selects_battlefield_permanent(origin, target) {
+        // CR 115.1: battlefield non-targeted picks (Sothera / Strategic Betrayal
+        // edict class) resolve via EffectZoneChoice after player_scope rebinding,
+        // not stack targeting.
+        // Graveyard/hand/library seeds without "target" (Deadly Cover-Up) keep
+        // stack-time selection — their filters carry explicit InZone constraints
+        // and origin is None (not off_battlefield_origin above).
+        TargetChoiceTiming::Resolution
+    } else {
+        TargetChoiceTiming::Stack
+    }
+}
+
 pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetChoiceTiming {
     if let Effect::ChooseCounterKind { target } = &clause_ir.parsed.effect {
         let lower = clause_ir
@@ -1700,37 +1744,21 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
         }
     }
 
+    // Mass `ChangeZoneAll` stays Stack here (pre-#6446). The TargetOnly wrap
+    // may still stamp Resolution on ChangeZoneAll resolution-picks via the
+    // shared helper; clause-IR timing must not silently reclassify every
+    // off-BF mass move (Bomat Courier / Jace −12 snapshot regressions).
     let Effect::ChangeZone { origin, target, .. } = &clause_ir.parsed.effect else {
         return TargetChoiceTiming::Stack;
     };
-    let off_battlefield_origin = origin.is_some_and(|zone| zone != Zone::Battlefield)
-        || (clause_ir.multi_target.is_some() || clause_ir.parsed.multi_target.is_some())
-            && target
-                .extract_zones()
-                .iter()
-                .any(|zone| *zone != Zone::Battlefield);
     let lower = clause_ir
         .source
         .fragment()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if off_battlefield_origin {
-        if nom_primitives::scan_contains(&lower, "target ") {
-            TargetChoiceTiming::Stack
-        } else {
-            TargetChoiceTiming::Resolution
-        }
-    } else if nom_primitives::scan_contains(&lower, "target ") {
-        TargetChoiceTiming::Stack
-    } else if change_zone_selects_battlefield_permanent(*origin, target) {
-        // CR 115.1: battlefield non-targeted picks (Sothera edict class) resolve
-        // via EffectZoneChoice after player_scope rebinding, not stack targeting.
-        // Graveyard/hand/library seeds without "target" (Deadly Cover-Up) keep
-        // stack-time selection — their filters carry explicit InZone constraints.
-        TargetChoiceTiming::Resolution
-    } else {
-        TargetChoiceTiming::Stack
-    }
+    let has_multi_target =
+        clause_ir.multi_target.is_some() || clause_ir.parsed.multi_target.is_some();
+    change_zone_target_choice_timing(*origin, target, has_multi_target, &lower)
 }
 
 /// CR 303.4f: Aura entering by non-spell means — controller chooses the enchanted object.
