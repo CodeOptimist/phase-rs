@@ -9692,16 +9692,26 @@ pub enum DistributionUnit {
 /// resource (energy, life, generic mana, counters); `LoopCollapse` is the one
 /// non-payment member — its N is the finite count an accepted CR 732.2a
 /// object-growth loop collapses into, deducting nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum PayableResource {
     /// CR 107.14: Pay any amount of `{E}` — removes N energy counters from the player.
     Energy,
-    /// CR 107.3 + CR 118.1: Pay a chosen X as generic mana while resolving an effect.
-    ManaGeneric {
-        #[serde(default = "default_one")]
-        per_x: u32,
-    },
+    /// CR 107.3f + CR 118.1 + CR 118.12: Pay a chosen X as part of a
+    /// resolution-time mana cost. `base_cost` is the UNCONCRETIZED cost
+    /// (still carrying `ManaCostShard::X` plus any colored/generic pips
+    /// alongside it, e.g. `{X}{W}{U}{B}`); the submit handler concretizes X
+    /// into it (`ManaCost::concretize_x`) and pays the resulting cost through
+    /// the standard mana-payment authority, so colored requirements are
+    /// enforced exactly like any other mana cost — never dropped in favor of
+    /// a generic-only payment (Elenda and Azor, #6410).
+    ///
+    /// `base_cost` intentionally carries NO `#[serde(default)]`: a serialized
+    /// prompt missing this field must fail deserialization rather than
+    /// silently resolve to `ManaCost::zero()`, which would concretize to a
+    /// free payment (drops the fixed pips AND the X basis) instead of
+    /// visibly rejecting the incompatible/corrupt save.
+    ManaGeneric { base_cost: ManaCost },
     /// CR 107.1c + CR 122.1: Choose how many counters to remove.
     Counters,
     /// CR 119.4: Pay any amount of life — N is deducted as life loss via
@@ -9801,10 +9811,6 @@ impl LoopCollapseAxis {
             | ResourceAxis::Poison(_) => None,
         }
     }
-}
-
-fn default_one() -> u32 {
-    1
 }
 
 /// CR 115.7: Scope of retargeting — single target, all targets, or forced.
@@ -21982,6 +21988,31 @@ mod tests {
                     source: CompanionChoiceSource::Sideboard { index: 2 },
                 }],
             }
+        );
+    }
+
+    /// #6410 review follow-up: `PayableResource::ManaGeneric::base_cost`
+    /// deliberately carries NO `#[serde(default)]`. A prior revision of this
+    /// fix defaulted the missing field to `ManaCost::zero()`, which would
+    /// have concretized a legacy/incomplete serialized prompt into a FREE
+    /// payment (drops both the fixed colored pips and the X basis) instead
+    /// of failing closed. A serialized prompt missing `base_cost` — whether
+    /// from the pre-fix `per_x`-only wire shape or any other truncation —
+    /// must be REJECTED at the deserialization boundary, never silently
+    /// downgraded to a zero-cost payment.
+    #[test]
+    fn pay_amount_choice_mana_generic_missing_base_cost_is_rejected() {
+        let empty_data = r#"{"type":"ManaGeneric","data":{}}"#;
+        assert!(
+            serde_json::from_str::<PayableResource>(empty_data).is_err(),
+            "a ManaGeneric prompt with no base_cost must fail to deserialize, \
+             not silently default to a zero-cost payment"
+        );
+
+        let legacy_per_x_shape = r#"{"type":"ManaGeneric","data":{"per_x":1}}"#;
+        assert!(
+            serde_json::from_str::<PayableResource>(legacy_per_x_shape).is_err(),
+            "the pre-fix per_x-only wire shape has no base_cost and must be rejected too"
         );
     }
 

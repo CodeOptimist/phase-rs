@@ -68,6 +68,12 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * of silently corrupting state.
  *
  * Bumps to date:
+ *  16 — PayableResource::ManaGeneric changed from { per_x } to
+ *       { base_cost: ManaCost } (#6410) — a GameState payload field type
+ *       change, and base_cost intentionally carries no serde default (a
+ *       missing base_cost must fail deserialization, not silently resolve
+ *       to a zero-cost payment), so old and new peers can't parse each
+ *       other's serialized snapshots.
  *   1 — pre-compression JSON-serialization era (no longer in production)
  *   2 — gzip + version-prefixed binary wire format
  *   3 — Planechase state and action payloads in game_setup/reconnect snapshots
