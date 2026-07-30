@@ -87,9 +87,9 @@ use super::oracle_keyword::{
 };
 use super::oracle_level::parse_level_blocks;
 use super::oracle_modal::{
-    extract_ability_word_reminder_body, lower_oracle_block, parse_oracle_block,
+    extract_ability_word_reminder_body, lower_oracle_block_ir, parse_oracle_block,
     split_short_label_prefix, strip_ability_word, strip_ability_word_with_name,
-    strip_flavor_word_with_name, FLAVOR_WORD_COST_LABEL_MAX_WORDS,
+    strip_flavor_word_with_name, AnchorModeIr, OracleBlockIr, FLAVOR_WORD_COST_LABEL_MAX_WORDS,
 };
 use super::oracle_replacement::{
     find_copy_verb_present, lower_as_enters_becomes_choice_modal,
@@ -1195,7 +1195,6 @@ fn try_split_and_cant_become_untapped(
 fn item_replacement(item: &OracleItemIr) -> Option<&ReplacementDefinition> {
     match &item.node {
         OracleNodeIr::Replacement(replacement_ir) => Some(&replacement_ir.definition),
-        OracleNodeIr::PreLoweredReplacement(def) => Some(def),
         _ => None,
     }
 }
@@ -1266,7 +1265,6 @@ fn item_trigger(item: &OracleItemIr) -> Option<Cow<'_, TriggerDefinition>> {
 fn item_static(item: &OracleItemIr) -> Option<&StaticDefinition> {
     match &item.node {
         OracleNodeIr::Static(ir) => Some(&ir.definition),
-        OracleNodeIr::PreLoweredStatic(def) => Some(def),
         _ => None,
     }
 }
@@ -3129,14 +3127,6 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
                 result.triggers.push(def);
                 trigger_ids.push(item.id);
             }
-            OracleNodeIr::PreLoweredStatic(def) => {
-                result.statics.push(def.clone());
-                static_ids.push(item.id);
-            }
-            OracleNodeIr::PreLoweredReplacement(def) => {
-                result.replacements.push(def.clone());
-                replacement_ids.push(item.id);
-            }
             OracleNodeIr::PreLoweredSpell(def) => {
                 let mut def = def.clone();
                 stamp_printed_ability_slot(&mut def, result.abilities.len());
@@ -3851,10 +3841,6 @@ impl<'a> DocEmitter<'a> {
             },
         );
     }
-    fn trigger_at(&mut self, line: usize, def: TriggerDefinition) {
-        self.last_trigger = Some(def.clone());
-        self.emit_at(line, OracleNodeIr::PreLoweredTrigger(def));
-    }
     /// Mirrors `static_ir_at`: the peek mirror stores the LOWERED definition, so
     /// the peek reader is unchanged and no `source_text` is invented for a slot
     /// nothing reads it from. Lowering here is a clone (`lower_trigger_node_ir`
@@ -3862,10 +3848,6 @@ impl<'a> DocEmitter<'a> {
     fn trigger_ir_at(&mut self, line: usize, ir: TriggerNodeIr) {
         self.last_trigger = Some(lower_trigger_node_ir(&ir));
         self.emit_at(line, OracleNodeIr::Trigger(ir));
-    }
-    fn static_at(&mut self, line: usize, def: StaticDefinition) {
-        self.last_static = Some(def.clone());
-        self.emit_at(line, OracleNodeIr::PreLoweredStatic(def));
     }
     fn static_ir_at(&mut self, line: usize, ir: StaticIr) {
         self.last_static = Some(lower_static_ir(&ir));
@@ -3922,39 +3904,6 @@ impl<'a> DocEmitter<'a> {
         }
     }
 
-    /// Move every vector item a `&mut ParsedAbilities`-taking mutator just pushed
-    /// into the builder at `item_line`, then clear them. Used for the complex
-    /// cross-file mutators (modal / enters-replacement lowering) that the (B)
-    /// tuple-return design does NOT rewrite internally: they still push into a
-    /// scratch `ParsedAbilities`, and this drains that scratch into source-ordered
-    /// emission. `result`'s SINGLETON fields (modal/additional_cost/…) are left
-    /// untouched — the caller handles those.
-    fn drain_result_vectors(&mut self, item_line: usize, result: &mut ParsedAbilities) {
-        for def in std::mem::take(&mut result.abilities) {
-            self.ability_at(item_line, def);
-        }
-        for def in std::mem::take(&mut result.triggers) {
-            self.trigger_at(item_line, def);
-        }
-        for def in std::mem::take(&mut result.statics) {
-            self.static_at(item_line, def);
-        }
-        for def in std::mem::take(&mut result.replacements) {
-            self.replacement_at(item_line, def);
-        }
-        for kw in std::mem::take(&mut result.extracted_keywords) {
-            self.keyword_at(item_line, kw);
-        }
-        for r in std::mem::take(&mut result.casting_restrictions) {
-            self.casting_restriction_at(item_line, r);
-        }
-        for o in std::mem::take(&mut result.casting_options) {
-            self.casting_option_at(item_line, o);
-        }
-    }
-    fn replacement_at(&mut self, line: usize, def: ReplacementDefinition) {
-        self.emit_at(line, OracleNodeIr::PreLoweredReplacement(def));
-    }
     fn keyword_at(&mut self, line: usize, kw: Keyword) {
         self.emit_at(line, OracleNodeIr::Keyword(kw));
     }
@@ -4504,7 +4453,57 @@ pub(crate) fn parse_oracle_ir(
             continue;
         }
 
-        // Priority 0: Semicolon-separated keyword lines (e.g., "Defender; reach").
+        // Priority 0: Modal block (standard "Choose one —" + modes, or Spree + modes).
+        // Must run before keyword extraction so "Spree" header + follow-on `+` lines
+        // are consumed as a modal block, not swallowed as a keyword-only line.
+        if let Some((block, next_i)) = parse_oracle_block(&lines, i) {
+            match lower_oracle_block_ir(block, card_name, ctx.host_self_reference.clone(), &mut ctx)
+            {
+                OracleBlockIr::Activated(ability) => {
+                    emitter.ability_ir_at(item_line, ability);
+                }
+                OracleBlockIr::Modal { choice, modes } => {
+                    for mode in modes {
+                        emitter.ability_ir_at(
+                            mode.source_line
+                                .expect("collected modal bullets have source lines"),
+                            *mode.ability,
+                        );
+                    }
+                    emitter.modal_at(item_line, choice);
+                }
+                OracleBlockIr::Triggered(triggers) => {
+                    for trigger in triggers {
+                        emitter.trigger_ir_at(item_line, TriggerNodeIr::Parsed(Box::new(trigger)));
+                    }
+                }
+                OracleBlockIr::AsEnters {
+                    replacement,
+                    children,
+                } => {
+                    emitter.replacement_ir_at(item_line, replacement);
+                    for (line, children) in children {
+                        for child in children {
+                            match child {
+                                AnchorModeIr::Trigger(trigger) => {
+                                    emitter.trigger_ir_at(line, TriggerNodeIr::Parsed(trigger))
+                                }
+                                AnchorModeIr::Static(static_ir) => {
+                                    emitter.static_ir_at(line, *static_ir)
+                                }
+                                AnchorModeIr::Unsupported(ability) => {
+                                    emitter.ability_ir_at(line, *ability);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = next_i;
+            continue;
+        }
+
+        // Priority 1: Semicolon-separated keyword lines (e.g., "Defender; reach").
         // Oracle text uses semicolons exclusively to separate keywords on a single line.
         // The colon guard prevents splitting activated ability lines like "{T}: Draw a card".
         if line.contains(';') && !line.contains(':') {
@@ -4530,27 +4529,6 @@ pub(crate) fn parse_oracle_ir(
                     continue;
                 }
             }
-        }
-
-        // Priority 1: Modal block (standard "Choose one —" + modes, or Spree + modes).
-        // Must run before keyword extraction so "Spree" header + follow-on `+` lines
-        // are consumed as a modal block, not swallowed as a keyword-only line.
-        if let Some((block, next_i)) = parse_oracle_block(&lines, i) {
-            // Modal lowering still pushes into a scratch `ParsedAbilities`; drain
-            // its vector output into source-ordered emission at the block's line,
-            // and capture the `modal` singleton's line for post-loop emission.
-            lower_oracle_block(
-                block,
-                card_name,
-                ctx.host_self_reference.clone(),
-                &mut result,
-            );
-            emitter.drain_result_vectors(item_line, &mut result);
-            if result.modal.is_some() {
-                modal_line.get_or_insert(item_line);
-            }
-            i = next_i;
-            continue;
         }
 
         // Pre-keyword activated ability: "Equip {cost}" / "Equip — {cost}"
@@ -6286,6 +6264,7 @@ pub(crate) fn parse_oracle_ir(
                     shell: AbilityShellIr::default(),
                     die_results: vec![],
                     root_transforms: vec![],
+                    modal: None,
                 }
             } else if let Some(vote) = crate::parser::oracle_vote::parse_vote_block_ir(
                 parse_line,
@@ -6298,6 +6277,7 @@ pub(crate) fn parse_oracle_ir(
                     shell: AbilityShellIr::default(),
                     die_results: vec![],
                     root_transforms: vec![],
+                    modal: None,
                 }
             } else {
                 parse_ability_ir_with_context(parse_line, AbilityKind::Spell, &mut ctx)
@@ -7127,6 +7107,7 @@ pub(crate) fn try_parse_equip(line: &str) -> Option<AbilityIr> {
             ..AbilityShellIr::default()
         },
         die_results: vec![],
+        modal: None,
         root_transforms: vec![],
     })
 }
