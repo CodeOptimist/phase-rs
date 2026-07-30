@@ -9,7 +9,7 @@ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::doc::{OracleDocIr, OracleNodeIr};
 use crate::parser::oracle_ir::trigger::TriggerNodeIr;
 use crate::types::ability::MultiTargetSpec;
-use crate::types::ability::{Effect, TriggerCondition};
+use crate::types::ability::{Effect, TargetChoiceTiming, TriggerCondition};
 use crate::types::game_state::DistributionUnit;
 
 fn ability_has_unimplemented(def: &crate::types::ability::AbilityDefinition) -> bool {
@@ -199,6 +199,62 @@ fn nonterminal_activated_die_roll_does_not_consume_following_ability() {
         lowered.abilities[1].effect.as_ref(),
         Effect::Mana { .. }
     ));
+}
+
+/// CR 700.3 + CR 701.38: Priority 9 keeps its pile and vote roots native until
+/// document lowering; their nested per-choice and chosen-pile payloads remain
+/// deliberately pre-lowered effect internals.
+#[test]
+fn priority_nine_spell_router_keeps_vote_and_pile_roots_native() {
+    let (vote_ir, vote_lowered) = parse_two_layer(
+        "Starting with you, each player votes for evidence or bribery. For each evidence vote, investigate. For each bribery vote, create a Treasure token.",
+        "Vote Spell Fixture",
+        &["Sorcery"],
+        &[],
+    );
+    assert!(matches!(vote_ir.items[0].node, OracleNodeIr::Spell(_)));
+    assert!(matches!(
+        vote_lowered.abilities[0].effect.as_ref(),
+        Effect::Vote { .. }
+    ));
+
+    let (pile_ir, pile_lowered) = parse_two_layer(
+        "Reveal the top five cards of your library. An opponent separates those cards into two piles. Put one pile into your hand and the other into your graveyard.",
+        "Fact or Fiction",
+        &["Instant"],
+        &[],
+    );
+    assert!(matches!(pile_ir.items[0].node, OracleNodeIr::Spell(_)));
+    assert!(matches!(
+        pile_lowered.abilities[0].effect.as_ref(),
+        Effect::SeparateIntoPiles { .. }
+    ));
+}
+
+/// CR 601.2b: Priority 9 keeps all aggregate source text and the X floor on
+/// the native node until document lowering.
+#[test]
+fn priority_nine_multiline_spell_keeps_description_and_x_floor_in_ir() {
+    let oracle_text = "Draw a card.\nThen draw a card.\nX can't be 0.";
+    let (ir, lowered) = parse_two_layer(oracle_text, "Multiline Spell Fixture", &["Sorcery"], &[]);
+    let OracleNodeIr::Spell(ability) = &ir.items[0].node else {
+        panic!("multiline spell must remain native IR");
+    };
+    assert!(ability.root_transforms.iter().any(|transform| matches!(
+        transform,
+        crate::parser::oracle_ir::effect_chain::AbilityRootTransform::SetMinXValue(1)
+    )));
+    assert!(ability.root_transforms.iter().any(|transform| matches!(
+        transform,
+        crate::parser::oracle_ir::effect_chain::AbilityRootTransform::SetDescription(description)
+            if description == "Draw a card.\nThen draw a card."
+    )));
+    assert_eq!(lowered.abilities.len(), 1);
+    assert_eq!(lowered.abilities[0].min_x_value, 1);
+    assert_eq!(
+        lowered.abilities[0].description.as_deref(),
+        Some("Draw a card.\nThen draw a card.")
+    );
 }
 
 /// CR 706.3b: ordinary trigger dispatch retains a die-result table in native
@@ -1512,8 +1568,190 @@ fn follow_the_lumarets() {
         &["Sorcery"],
         &[],
     );
+    assert!(matches!(ir.items[0].node, OracleNodeIr::Spell(_)));
+    assert_eq!(
+        lowered.abilities.len(),
+        1,
+        "the Dig override must bind through the document relation"
+    );
+    assert!(lowered.abilities[0].else_ability.is_some());
     insta::assert_json_snapshot!("follow_the_lumarets_ir", &ir);
     insta::assert_json_snapshot!("follow_the_lumarets_lowered", &lowered);
+}
+
+/// CR 614.6 + CR 614.15: an override whose condition cannot lower stays on the
+/// `instead_override` floor; it must never become an independent second spell.
+#[test]
+fn priority_nine_unbindable_conditioned_replacement_stays_honest() {
+    let (ir, lowered) = parse_two_layer(
+        "Draw a card.\nMystery — Draw two cards instead if the cracks in this artifact's art are completely covered.",
+        "Unbindable Override Fixture",
+        &["Sorcery"],
+        &[],
+    );
+    assert!(matches!(ir.items[0].node, OracleNodeIr::Spell(_)));
+    assert!(matches!(ir.items[1].node, OracleNodeIr::Spell(_)));
+    assert_eq!(lowered.abilities.len(), 2);
+    assert!(matches!(
+        lowered.abilities[1].effect.as_ref(),
+        Effect::Unimplemented { name, .. } if name == "instead_override"
+    ));
+    assert!(lowered.abilities[1].condition.is_none());
+}
+
+fn assert_unbindable_override(def: &crate::types::ability::AbilityDefinition) {
+    assert!(matches!(
+        def.effect.as_ref(),
+        Effect::Unimplemented { name, .. } if name == "instead_override"
+    ));
+    assert!(def.sub_ability.is_none());
+    assert!(def.else_ability.is_none());
+}
+
+fn roll_die_result_count(def: &crate::types::ability::AbilityDefinition) -> Option<usize> {
+    match def.effect.as_ref() {
+        Effect::RollDie { results, .. } => Some(results.len()),
+        _ => def
+            .sub_ability
+            .as_deref()
+            .and_then(roll_die_result_count)
+            .or_else(|| def.else_ability.as_deref().and_then(roll_die_result_count)),
+    }
+}
+
+/// CR 706.3b: recognized contiguous result branches stay with an inline roll
+/// even when the ability's paragraph has instructions both before and after it.
+fn assert_inline_die_table(
+    oracle_text: &str,
+    card_name: &str,
+    types: &[&str],
+    expected_recognized_results: usize,
+) {
+    let (_, lowered) = parse_two_layer(oracle_text, card_name, types, &[]);
+    assert_eq!(
+        lowered.abilities.len(),
+        1,
+        "{card_name} must retain its result rows on the printed ability"
+    );
+    assert_eq!(
+        roll_die_result_count(&lowered.abilities[0]),
+        Some(expected_recognized_results),
+        "{card_name} must retain its recognized result branches on the inline roll"
+    );
+}
+
+#[test]
+fn laezels_acrobatics_inline_die_table_is_owned_by_nonterminal_roll() {
+    assert_inline_die_table(
+        "Exile all nontoken creatures you control, then roll a d20.\n1—9 | Return those cards to the battlefield under their owner's control at the beginning of the next end step.\n10—20 | Return those cards to the battlefield under their owner's control, then exile them again. Return those cards to the battlefield under their owner's control at the beginning of the next end step.",
+        "Lae'zel's Acrobatics",
+        &["Instant"],
+        1,
+    );
+}
+
+#[test]
+fn overwhelming_encounter_inline_die_table_is_owned_by_nonterminal_roll() {
+    assert_inline_die_table(
+        "Creatures you control gain vigilance and trample until end of turn. Roll a d20.\n1—9 | Creatures you control get +2/+2 until end of turn.\n10—19 | Put two +1/+1 counters on each creature you control.\n20 | Put four +1/+1 counters on each creature you control.",
+        "Overwhelming Encounter",
+        &["Sorcery"],
+        2,
+    );
+}
+
+#[test]
+fn deck_of_many_things_inline_die_table_is_owned_by_modified_roll() {
+    assert_inline_die_table(
+        "{2}, {T}: Roll a d20 and subtract the number of cards in your hand. If the result is 0 or less, discard your hand.\n1—9 | Return a card at random from your graveyard to your hand.\n10—19 | Draw two cards.\n20 | Put a creature card from any graveyard onto the battlefield under your control. When that creature dies, its owner loses the game.",
+        "The Deck of Many Things",
+        &["Artifact"],
+        3,
+    );
+}
+
+#[test]
+fn wand_of_wonder_inline_die_table_is_owned_by_roll_with_later_instructions() {
+    assert_inline_die_table(
+        "{4}, {T}: Roll a d20. Each opponent exiles cards from the top of their library until they exile an instant or sorcery card, then shuffles the rest into their library. You may cast up to X instant and/or sorcery spells from among cards exiled this way without paying their mana costs.\n1—9 | X is one.\n10—19 | X is two.\n20 | X is three.",
+        "Wand of Wonder",
+        &["Artifact"],
+        3,
+    );
+}
+
+#[test]
+fn inline_roll_without_immediate_result_row_does_not_consume_following_text() {
+    let (ir, lowered) = parse_two_layer(
+        "Draw a card, then roll a d20.\nFlying\n1—20 | Draw two cards.",
+        "Inline Roll Without Table Fixture",
+        &["Sorcery"],
+        &[],
+    );
+    assert!(!ir.items.is_empty());
+    assert!(!lowered.abilities.is_empty());
+    assert_eq!(roll_die_result_count(&lowered.abilities[0]), Some(0));
+}
+
+#[test]
+fn roll_text_without_typed_roll_die_does_not_consume_result_rows() {
+    let (ir, lowered) = parse_two_layer(
+        "Draw a card, then roll a dword.\n1—20 | Draw two cards.",
+        "Unparsed Roll Text Fixture",
+        &["Sorcery"],
+        &[],
+    );
+    assert_eq!(ir.items.len(), 2);
+    assert_eq!(lowered.abilities.len(), 2);
+    assert_eq!(roll_die_result_count(&lowered.abilities[0]), None);
+}
+
+/// CR 614.6 + CR 614.15: the native override floor retains the root clause's
+/// resolution metadata while making the unsupported replacement explicit.
+#[test]
+fn caravan_vigil_unbindable_override_retains_optional() {
+    let (_, lowered) = parse_two_layer(
+        "Search your library for a basic land card, reveal it, put it into your hand, then shuffle.\nMorbid — You may put that card onto the battlefield instead of putting it into your hand if a creature died this turn.",
+        "Caravan Vigil",
+        &["Sorcery"],
+        &[],
+    );
+    let override_def = &lowered.abilities[1];
+    assert_unbindable_override(override_def);
+    assert!(override_def.optional);
+}
+
+/// CR 614.6 + CR 614.15: partial cross-line replacements preserve a parsed
+/// optional root even when the replacement cannot bind safely.
+#[test]
+fn talent_of_the_telepath_unbindable_override_retains_optional() {
+    let (_, lowered) = parse_two_layer(
+        "Target opponent reveals the top seven cards of their library. You may cast an instant or sorcery spell from among them without paying its mana cost. Then that player puts the rest into their graveyard.\nSpell mastery — If there are two or more instant and/or sorcery cards in your graveyard, you may cast up to two instant and/or sorcery spells from among the revealed cards instead of one.",
+        "Talent of the Telepath",
+        &["Sorcery"],
+        &[],
+    );
+    let override_def = &lowered.abilities[1];
+    assert_unbindable_override(override_def);
+    assert!(override_def.optional);
+}
+
+/// CR 614.6 + CR 614.15: an unbindable partial replacement keeps the original
+/// root's resolution-time selection stamp instead of inferring it from the floor.
+#[test]
+fn see_the_unwritten_unbindable_override_retains_target_choice_timing() {
+    let (_, lowered) = parse_two_layer(
+        "Reveal the top eight cards of your library. You may put a creature card from among them onto the battlefield. Put the rest into your graveyard.\nFerocious — If you control a creature with power 4 or greater, you may put two creature cards onto the battlefield instead of one.",
+        "See the Unwritten",
+        &["Sorcery"],
+        &[],
+    );
+    let override_def = &lowered.abilities[1];
+    assert_unbindable_override(override_def);
+    assert_eq!(
+        override_def.target_choice_timing,
+        TargetChoiceTiming::Resolution
+    );
 }
 
 // CR 614.1a + CR 608.2c: Instead — the multi-clause Cow-swap. Clause 1 ("gain

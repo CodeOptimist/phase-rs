@@ -155,9 +155,9 @@ use self::subject::{
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::{ParseContext, TokenPtFollowup};
 use crate::parser::oracle_ir::effect_chain::{
-    AbilityIr, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr, ClauseIrBuilder,
-    DieResultBranchIr, EffectChainIr, OtherwiseKind, PlayerScopeRewrite, PriorModifier,
-    ReplaceMeaningKind, ReplicateKind, ShellStage,
+    AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr,
+    ClauseIrBuilder, DieResultBranchIr, EffectChainIr, OtherwiseKind, PlayerScopeRewrite,
+    PriorModifier, ReplaceMeaningKind, ReplicateKind, ResidualConditionPolicy, ShellStage,
 };
 use crate::types::mana::ManaExpiry;
 
@@ -26983,7 +26983,7 @@ pub(crate) enum ChainLoweringMode {
 /// # The order is pinned and behavior-load-bearing
 ///
 /// **chain → die results → finalize → anchor → `sub_link` → envelope stamps →
-/// stages.**
+/// stages → root transforms.**
 ///
 /// It is not an aesthetic choice: it reproduces what the whole-body recognizers
 /// in `oracle.rs` do by hand. Every one of them stamps its root fields *after*
@@ -27022,7 +27022,53 @@ pub(crate) fn lower_ability_ir(ir: &AbilityIr) -> AbilityDefinition {
             }
         }
     }
+    apply_ability_root_transforms(&mut def, &ir.root_transforms);
     def
+}
+
+/// Apply ordered whole-ability transforms after every chain and shell stage.
+///
+/// CR 608.2c: this is the only point where the final root is known, so the
+/// condition order is preserved without assuming any particular clause becomes
+/// that root during assembly.
+fn apply_ability_root_transforms(def: &mut AbilityDefinition, transforms: &[AbilityRootTransform]) {
+    for transform in transforms {
+        match transform {
+            AbilityRootTransform::SetMinXValue(min_x_value) => {
+                def.min_x_value = *min_x_value;
+            }
+            AbilityRootTransform::SetDescription(description) => {
+                def.description = Some(description.clone());
+            }
+            AbilityRootTransform::InsteadOverrideResidual {
+                fragment,
+                condition_policy,
+            } => {
+                *def.effect = Effect::unimplemented("instead_override", fragment);
+                def.sub_ability = None;
+                def.else_ability = None;
+                match condition_policy {
+                    ResidualConditionPolicy::Preserve => {}
+                    ResidualConditionPolicy::Clear => def.condition = None,
+                }
+            }
+            AbilityRootTransform::PrependCondition(condition) => {
+                def.condition = match def.condition.take() {
+                    Some(chain) => Some(crate::parser::oracle::merge_ability_condition(
+                        Some(condition.clone()),
+                        chain,
+                    )),
+                    None => Some(condition.clone()),
+                };
+            }
+            AbilityRootTransform::AppendCondition(condition) => {
+                def.condition = Some(crate::parser::oracle::merge_ability_condition(
+                    def.condition.take(),
+                    condition.clone(),
+                ));
+            }
+        }
+    }
 }
 
 /// CR 706.3b: Attach typed die-result branches before finalization so every
@@ -27031,12 +27077,37 @@ pub(crate) fn attach_die_result_branches_before_finalization(
     def: &mut AbilityDefinition,
     die_results: &[DieResultBranchIr],
 ) {
+    attach_die_result_branches_to_roll_before_finalization(
+        def,
+        die_results,
+        super::oracle_special::find_result_table_roll_die,
+    );
+}
+
+/// CR 706.3b: Trigger result tables retain their established terminal-roll
+/// ownership. Trigger IR only captures tables for terminal rolls.
+pub(crate) fn attach_terminal_die_result_branches_before_finalization(
+    def: &mut AbilityDefinition,
+    die_results: &[DieResultBranchIr],
+) {
+    attach_die_result_branches_to_roll_before_finalization(
+        def,
+        die_results,
+        super::oracle_special::find_terminal_roll_die,
+    );
+}
+
+/// CR 706.3b: Lower typed result branches through the single ability-IR
+/// authority before assigning them to their selected roll instruction.
+fn attach_die_result_branches_to_roll_before_finalization(
+    def: &mut AbilityDefinition,
+    die_results: &[DieResultBranchIr],
+    find_roll_die: for<'a> fn(&'a mut AbilityDefinition) -> Option<&'a mut Effect>,
+) {
     if die_results.is_empty() {
         return;
     }
-    if let Some(Effect::RollDie { results, .. }) =
-        super::oracle_special::find_terminal_roll_die(def)
-    {
+    if let Some(Effect::RollDie { results, .. }) = find_roll_die(def) {
         *results = die_results
             .iter()
             .map(|DieResultBranchIr { min, max, effect }| DieResultBranch {
@@ -27133,6 +27204,7 @@ pub(crate) fn parse_ability_ir(
             body,
             shell: AbilityShellIr::default(),
             die_results: vec![],
+            root_transforms: vec![],
         };
     }
     if let Some(body) = parse_for_each_attacker_copy_blocker_ir(text, kind, ctx) {
@@ -27141,6 +27213,7 @@ pub(crate) fn parse_ability_ir(
             body,
             shell: AbilityShellIr::default(),
             die_results: vec![],
+            root_transforms: vec![],
         };
     }
     if let ChainLoweringMode::WithContext = mode {
@@ -27150,6 +27223,7 @@ pub(crate) fn parse_ability_ir(
                 body,
                 shell: AbilityShellIr::default(),
                 die_results: vec![],
+                root_transforms: vec![],
             };
         }
     }
@@ -27164,6 +27238,7 @@ pub(crate) fn parse_ability_ir(
                 ..AbilityShellIr::default()
             },
             die_results: vec![],
+            root_transforms: vec![],
         };
     }
     AbilityIr {
@@ -27171,6 +27246,7 @@ pub(crate) fn parse_ability_ir(
         body: parse_effect_chain_ir(text, kind, ctx),
         shell: AbilityShellIr::default(),
         die_results: vec![],
+        root_transforms: vec![],
     }
 }
 
@@ -29069,10 +29145,11 @@ pub(crate) fn parse_effect_chain_ir(
                 prev_clause.map(|c| AbilityDefinition::new(kind, c.parsed.effect.clone()));
             let inherited_where_x_expression =
                 prev_clause.and_then(|c| c.where_x_expression.clone());
-            if let Some(alt_def) =
+            if let Some(alt_ir) =
                 try_parse_dig_instead_alternative(normalized_text, prev_temp.as_ref(), kind, ctx)
             {
                 if !builder.is_empty() {
+                    let alt_def = lower_ability_ir(&alt_ir);
                     // Store the alt_def's effect as `parsed.effect` so followup continuation
                     // matching (e.g., PutRest for "put the rest on the bottom") can see that
                     // the effective last clause is a Dig. In the old code, `defs.last()` was

@@ -208,8 +208,7 @@ impl VoteIr {
         )
     }
 
-    /// Compatibility lowering for non-trigger callers that have not yet moved
-    /// to trigger-body IR. Trigger parsing uses [`Self::effect_chain`] instead.
+    /// Compatibility lowering for callers outside the native spell router.
     pub(crate) fn into_ability(self, kind: AbilityKind) -> AbilityDefinition {
         let vote = AbilityDefinition::new(kind, self.vote);
         match self.pre_vote_choose {
@@ -273,12 +272,6 @@ impl PileIr {
             self.actor.clone(),
             self.in_trigger,
         )
-    }
-
-    /// Compatibility lowering for non-trigger callers that still consume a
-    /// lowered definition. Trigger parsing uses [`Self::effect_chain`] instead.
-    pub(crate) fn into_ability(self, kind: AbilityKind) -> AbilityDefinition {
-        AbilityDefinition::new(kind, self.effect)
     }
 }
 
