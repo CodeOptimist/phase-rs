@@ -15078,6 +15078,18 @@ fn try_parse_for_each_counter_kind_adjust_target(text: &str) -> Option<ParsedEff
 }
 
 fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectClause {
+    // CR 601.2c: the announced target count for a "… to each of ⟨N⟩ …" head is a
+    // property of THIS clause only. `parse_imperative_effect` is also reached
+    // from sites that never consume this field (the shared-`ctx`
+    // `try_parse_reanimate_self_and_target` sub-parse) and from speculative
+    // sub-parses that mutate `ctx` and then discard their result (the
+    // radiance / multi-target-chain / general damage-compound splitters). Reset
+    // here — the very first statement, above every early-return guard — so a
+    // stale spec can never attach to a later, unrelated DealDamage. Same
+    // discipline as the `ctx.target_chooser = None;` resets in the damage-chain
+    // splitter.
+    ctx.pending_damage_multi_target = None;
+
     if let Some(effect) = try_parse_drawn_this_turn_choice(text) {
         return parsed_clause(effect);
     }
@@ -15212,6 +15224,11 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
 
     let (stripped, duration) = strip_trailing_duration(text);
     let mut clause = parse_imperative_effect(stripped, ctx);
+    // CR 601.2c: paired with the reset at the top of this function. The count is
+    // produced by the same parse that produced the target filter
+    // (`parse_each_of_target_distribution`), so it is the primary authority for
+    // the DealDamage fixup below.
+    let pending_damage_multi_target = ctx.pending_damage_multi_target.take();
     if clause.duration.is_none() {
         clause.duration = duration;
     }
@@ -15232,8 +15249,14 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
             .or_else(|| extract_bounded_target_multi_target(text))
             .or_else(|| extract_optional_target_multi_target(text));
     }
+    // CR 601.2c + CR 115.4: the announced target count for a
+    // "⟨source⟩ deals N damage to each of ⟨count⟩ ⟨noun⟩" head comes from the
+    // SAME parse that produced the target filter, so the ctx value is the
+    // primary authority here. The text-scanning extractor stays as a fallback
+    // for the shapes that combinator does not reach.
     if matches!(clause.effect, Effect::DealDamage { .. }) && clause.multi_target.is_none() {
-        clause.multi_target = extract_deal_damage_multi_target(text);
+        clause.multi_target =
+            pending_damage_multi_target.or_else(|| extract_deal_damage_multi_target(text));
     }
     // CR 115.1d: Post-parse fixup for SwitchPT prepositional form. The
     // imperative parser strips "any number of" / "each of" to keep `parse_target`
@@ -16806,6 +16829,23 @@ fn try_parse_radiance_color_fanout_damage(
     lower: &str,
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
+    // This recognizer speculatively parses the whole clause and abandons it on
+    // several branches below. A failed attempt must leave every parser-context
+    // field untouched — including `pending_damage_multi_target`, which
+    // `parse_each_of_target_distribution` records before any of those bails are
+    // reached. Same clone-and-commit shape as
+    // `try_parse_multi_target_damage_chain`.
+    let mut tentative_ctx = ctx.clone();
+    let clause = try_parse_radiance_color_fanout_damage_inner(text, lower, &mut tentative_ctx)?;
+    *ctx = tentative_ctx;
+    Some(clause)
+}
+
+fn try_parse_radiance_color_fanout_damage_inner(
+    text: &str,
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
     let (primary_effect, remainder) = try_parse_damage_with_remainder(text, lower, ctx)?;
 
     // Primary must be a single-target DealDamage at a typed object.
@@ -16931,6 +16971,12 @@ fn try_parse_multi_target_damage_chain_inner(
     // Each segment parses through the shared context, so retain the primary
     // segment's announcer before a continuation can overwrite it.
     let primary_target_chooser = ctx.target_chooser.clone();
+    // CR 601.2c: same for the primary segment's announced target count. This
+    // function returns its own `ParsedEffectClause` straight out of
+    // `lower_imperative_clause`, ahead of the `take()` + DealDamage fixup, so
+    // the count has to be captured here and attached below or a chain headed by
+    // "each of ⟨N⟩ target ⟨type⟩" silently degrades to one mandatory target.
+    let primary_damage_multi_target = ctx.pending_damage_multi_target.take();
     let trimmed = remainder.trim_start();
     let trimmed_lower = trimmed.to_lowercase();
     // A comma-delimited list ("..., M damage to T2, and K ...") or a bare
@@ -16951,7 +16997,11 @@ fn try_parse_multi_target_damage_chain_inner(
     // consumes one bare-damage segment (returning the next AbilityDefinition)
     // or aborts the entire chain — partial parses are not committed. Each
     // continuation retains its own target announcer.
-    let mut segments: Vec<(Effect, Option<TargetFilter>)> = Vec::new();
+    // CR 601.2c: each segment carries its OWN announced target count, not just
+    // its announcer. A continuation is a fresh instruction ("… and 1 damage to
+    // each of two target creatures"), so its count belongs to the sub-ability
+    // built from it, exactly as its `target_chooser` does.
+    let mut segments: Vec<(Effect, Option<TargetFilter>, Option<MultiTargetSpec>)> = Vec::new();
     let mut cursor = remainder.trim_start();
     while !cursor.is_empty() {
         let cursor_lower = cursor.to_lowercase();
@@ -16982,8 +17032,15 @@ fn try_parse_multi_target_damage_chain_inner(
         // is a distinct target phrase. Do not inherit the preceding recipient's
         // announcing-player override.
         ctx.target_chooser = None;
+        // CR 601.2c: likewise clear the pending count, so a segment without an
+        // "each of ⟨N⟩" head cannot inherit the previous segment's.
+        ctx.pending_damage_multi_target = None;
         let (segment_effect, leftover) = parse_bare_damage_continuation(after_separator, ctx)?;
-        segments.push((segment_effect, ctx.target_chooser.clone()));
+        segments.push((
+            segment_effect,
+            ctx.target_chooser.clone(),
+            ctx.pending_damage_multi_target.take(),
+        ));
         cursor = leftover.trim_start();
     }
 
@@ -16998,10 +17055,13 @@ fn try_parse_multi_target_damage_chain_inner(
     // damage-source semantics by construction (each is a `DealDamage` with
     // `damage_source: None`).
     let mut chain_tail: Option<Box<AbilityDefinition>> = None;
-    for (effect, target_chooser) in segments.into_iter().rev() {
+    for (effect, target_chooser, multi_target) in segments.into_iter().rev() {
         let mut def = AbilityDefinition::new(AbilityKind::Spell, effect);
         def.sub_ability = chain_tail.take();
         def.target_chooser = target_chooser;
+        // CR 601.2c: the segment's own announced count, so a continuation headed
+        // by "each of ⟨N⟩ …" requires and announces N targets rather than one.
+        def.multi_target = multi_target;
         chain_tail = Some(Box::new(def));
     }
 
@@ -17010,7 +17070,9 @@ fn try_parse_multi_target_damage_chain_inner(
         duration: None,
         sub_ability: chain_tail,
         distribute: None,
-        multi_target: None,
+        // CR 601.2c: the primary segment's announced target count, captured
+        // before the continuation segments reused the shared context.
+        multi_target: primary_damage_multi_target,
         condition: None,
         optional: false,
         unless_pay: None,
@@ -17460,6 +17522,25 @@ fn parse_bare_damage_continuation<'a>(
             rem_out,
         ));
     }
+    // CR 601.2c + CR 115.4: an "each of ⟨N⟩ ⟨noun⟩" continuation is a
+    // distribution head in its own right, not a plain recipient. Route it
+    // through the same authority the primary head uses so (a) the announced
+    // count is recorded on `ctx` — the chain loop takes it and attaches it to
+    // THIS segment's sub-ability — and (b) a bare-plural noun yields
+    // `TargetFilter::Any` rather than a typed filter. Without this the generic
+    // fallback below reaches `parse_target_with_ctx`, whose "each of" arm
+    // discards the count, and the continuation lowers as one mandatory target.
+    if let Some((target, rem)) = lower::parse_each_of_up_to_damage_target(after_to, ctx) {
+        return Some((
+            Effect::DealDamage {
+                amount,
+                target,
+                damage_source: None,
+                excess: None,
+            },
+            trim_dangling_target_word(rem),
+        ));
+    }
     let (target, rem) = parse_target_with_ctx(after_to, ctx);
     let (target, rem) = refine_damage_target_remainder(target, rem);
     let rem = trim_dangling_target_word(rem);
@@ -17610,6 +17691,13 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
     let (primary_effect, remainder) = try_parse_damage_with_remainder(text, &lower, ctx)?;
     // Preserve the primary target's announcer while parsing the continuation.
     let primary_target_chooser = ctx.target_chooser.clone();
+    // CR 601.2c: same for the primary clause's announced target count. The
+    // continuation below re-enters `lower_imperative_clause`, which clears
+    // `pending_damage_multi_target` on entry, so without this save/restore a
+    // compound "… to each of two target creatures and …" would lose the count
+    // the primary parse just recorded and fall back to the text-scanning
+    // extractor — i.e. silently back to a single mandatory target.
+    let primary_damage_multi_target = ctx.pending_damage_multi_target.take();
 
     if remainder.is_empty() {
         return None;
@@ -17648,6 +17736,12 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
     let mut sub_clause = parse_effect_clause(sub_parse_text, ctx);
     let sub_target_chooser = ctx.target_chooser.clone();
     ctx.target_chooser = primary_target_chooser;
+    // CR 601.2c: drop whatever the continuation recorded. The primary head's own
+    // count was saved before the sub-parse and is attached to the returned clause
+    // below — this function returns straight out of `lower_imperative_clause`,
+    // ahead of the `take()` + DealDamage fixup, so the count has to be applied
+    // here or it is lost.
+    ctx.pending_damage_multi_target = None;
 
     // Guard: if the sub-text parsed to Unimplemented, it's likely a target phrase
     // continuation ("each creature and planeswalker they control") rather than an
@@ -17674,7 +17768,9 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
         duration: None,
         sub_ability: Some(Box::new(sub_ability)),
         distribute: None,
-        multi_target: None,
+        // CR 601.2c: the primary head's announced target count, captured before
+        // the continuation's nested clause parse cleared the side channel.
+        multi_target: primary_damage_multi_target,
         condition: None,
         optional: false,
         unless_pay: None,
