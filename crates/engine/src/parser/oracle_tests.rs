@@ -7,6 +7,7 @@ use crate::parser::oracle_ir::doc::{
 use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::types::ability::{
     AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment, DoorLockOp,
+    SpellStackToGraveyardReplacement,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 
@@ -3294,11 +3295,14 @@ fn free_cast_window_clause_chains_rider_and_self_exile() {
             max_total_mv,
             filter,
             zones,
-            exile_instead_of_graveyard,
+            graveyard_replacement,
         } => {
             assert_eq!(*count, 2);
             assert_eq!(*max_total_mv, Some(6));
-            assert!(*exile_instead_of_graveyard);
+            assert_eq!(
+                graveyard_replacement.as_ref(),
+                Some(&SpellStackToGraveyardReplacement::Exile)
+            );
             assert_eq!(zones, &vec![Zone::Graveyard, Zone::Hand]);
             assert_eq!(
                 *filter,
@@ -3352,7 +3356,7 @@ fn free_cast_window_parses_single_zone_non_invoke_variant() {
         max_total_mv,
         filter,
         zones,
-        exile_instead_of_graveyard,
+        graveyard_replacement,
     } = &*result.abilities[0].effect
     else {
         panic!(
@@ -3368,7 +3372,7 @@ fn free_cast_window_parses_single_zone_non_invoke_variant() {
         TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))
     );
     assert_eq!(zones, &vec![Zone::Graveyard]);
-    assert!(!*exile_instead_of_graveyard);
+    assert!(graveyard_replacement.is_none());
 }
 
 /// Issue #2385 MED — `Effect::FreeCastFromZones` is a *free* cast. A

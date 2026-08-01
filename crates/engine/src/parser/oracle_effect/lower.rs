@@ -1028,11 +1028,11 @@ pub(super) fn attach_any_color_mana_rider_to_previous_play_from_exile(
 /// count 0, and duplicating it into a bogus `else_ability`). Building the rider
 /// directly here bypasses that generic mis-route.
 ///
-/// The exile destination is intentionally NOT handled here: it already lowers to
-/// the clean `ChangeZone{Exile, ParentTarget}` sub-ability via the general
-/// anaphor rebind (Torrential Gearhulk), and its effect shape never trips the
-/// bottom-cleanup detector. Returns `false` (no fold) for exile so that path is
-/// left undisturbed.
+/// The generic singular-spell route intentionally leaves exile to the existing
+/// `ChangeZone{Exile, ParentTarget}` anaphor path. The exact plural "a spell
+/// cast this way" form is handled separately by
+/// `attach_graveyard_redirect_rider_to_prior_free_cast_from_zones`, which is
+/// the only route that may attach stack/ParentTarget metadata for that wording.
 pub(super) fn attach_graveyard_redirect_rider_to_prior_cast_from_zone(
     defs: &mut [AbilityDefinition],
     dest: SpellStackToGraveyardReplacement,
@@ -1058,7 +1058,6 @@ pub(super) fn attach_graveyard_redirect_rider_to_prior_cast_from_zone(
             face_down_profile: None,
             enters_modified_if: None,
         },
-        // Exile keeps its existing clean `ChangeZone{Exile, ParentTarget}` path.
         SpellStackToGraveyardReplacement::Exile => return false,
     };
     let Some(prev) = defs.last_mut() else {
@@ -1070,6 +1069,29 @@ pub(super) fn attach_graveyard_redirect_rider_to_prior_cast_from_zone(
     let mut rider = AbilityDefinition::new(AbilityKind::Spell, rider_effect);
     rider.sub_link = SubAbilityLink::SequentialSibling;
     prev.sub_ability = Some(Box::new(rider));
+    true
+}
+
+/// CR 614.1a + CR 608.2g: absorb an exact "a spell cast this way" destination
+/// rider into the immediately preceding free-cast window. Unlike the legacy
+/// "that spell" form, this rider applies independently to every spell the
+/// window casts, so it belongs on `FreeCastFromZones` metadata rather than as a
+/// sequential `ParentTarget` sub-ability.
+pub(super) fn attach_graveyard_redirect_rider_to_prior_free_cast_from_zones(
+    defs: &mut [AbilityDefinition],
+    dest: SpellStackToGraveyardReplacement,
+) -> bool {
+    let Some(prev) = defs.last_mut() else {
+        return false;
+    };
+    let Effect::FreeCastFromZones {
+        graveyard_replacement,
+        ..
+    } = &mut *prev.effect
+    else {
+        return false;
+    };
+    *graveyard_replacement = Some(dest);
     true
 }
 
@@ -3971,8 +3993,40 @@ fn is_per_opponent_target_fanout_clause(clause: &ParsedEffectClause) -> bool {
     }
     clause.effect.target_filter().is_some_and(|filter| {
         target_filter_controller_ref(filter) == Some(ControllerRef::TargetPlayer)
-            && target_filter_is_single_object_target(filter)
+            && (target_filter_is_single_object_target(filter)
+                || target_filter_is_explicit_target_player_graveyard_card(filter))
     })
+}
+
+/// CR 115.1a + CR 108.3: The per-opponent fanout normally targets battlefield
+/// objects. This is the sole nonbattlefield exception: an explicit typed card
+/// target in a paired opponent's graveyard. An `Or` is allowed only when every
+/// branch independently carries that complete binding; it must not inherit the
+/// controller, ownership, or zone restriction from a sibling. This keeps "that
+/// player's graveyard" tied to the immediately preceding player target instead
+/// of broadly enabling all nonbattlefield fanout filters.
+pub(super) fn target_filter_is_explicit_target_player_graveyard_card(
+    filter: &TargetFilter,
+) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => {
+            tf.controller == Some(ControllerRef::TargetPlayer)
+                && !tf.type_filters.is_empty()
+                && tf.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::TargetPlayer,
+                })
+                && tf.properties.contains(&FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                })
+        }
+        TargetFilter::Or { filters } => {
+            !filters.is_empty()
+                && filters
+                    .iter()
+                    .all(target_filter_is_explicit_target_player_graveyard_card)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn target_filter_is_single_object_target(filter: &TargetFilter) -> bool {
