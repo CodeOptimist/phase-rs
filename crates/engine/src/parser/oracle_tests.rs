@@ -23036,6 +23036,299 @@ fn azors_gateway_transform_condition_parses_with_zero_swallowed_clauses() {
     assert!(transform.sub_ability.is_none());
 }
 
+/// Issue #6507 SHAPE: Gemstone Mine's sacrifice rider — "If there are no
+/// mining counters on this land, sacrifice it." — must bind the bare "it" to
+/// `SelfRef` (CR 608.2k: the rider's condition names the source, so the
+/// pronoun anaphors to the source permanent). Pre-fix the sub-ability carried
+/// `ParentTarget`, which a mana ability can never resolve (CR 605.1a — a mana
+/// ability requires no target), so the rider silently no-oped at runtime.
+#[test]
+fn depletion_land_rider_sacrifice_binds_self_ref() {
+    let text = "This land enters with three mining counters on it.\n{T}, Remove a mining \
+                counter from this land: Add one mana of any color. If there are no mining \
+                counters on this land, sacrifice it.";
+    let parsed = parse(text, "Gemstone Mine", &[], &["Land"], &[]);
+
+    // Reach-guards: the parse succeeded with zero swallowed clauses and zero
+    // Unimplemented markers, so the shape assertions below are not vacuous.
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "expected zero parse warnings, got {:#?}",
+        parsed.parse_warnings
+    );
+    fn has_unimpl(def: &AbilityDefinition) -> bool {
+        matches!(def.effect.as_ref(), Effect::Unimplemented { .. })
+            || def.sub_ability.as_deref().is_some_and(has_unimpl)
+    }
+    assert!(
+        !parsed.abilities.iter().any(has_unimpl),
+        "no Unimplemented anywhere in the parse: {:#?}",
+        parsed.abilities
+    );
+    assert_eq!(parsed.abilities.len(), 1);
+
+    let mana = &parsed.abilities[0];
+    assert!(
+        matches!(mana.effect.as_ref(), Effect::Mana { .. }),
+        "head effect must be the mana production, got {:?}",
+        mana.effect
+    );
+
+    let rider = mana.sub_ability.as_deref().expect("sacrifice sub-ability");
+    // CR 122.1: the gate reads the mining-counter total on the source.
+    assert_eq!(
+        rider.condition,
+        Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::CountersOn {
+                    scope: ObjectScope::Source,
+                    counter_type: Some(crate::types::counter::parse_counter_type("mining")),
+                },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        })
+    );
+    // CR 608.2k: "sacrifice it" = sacrifice the source land itself.
+    assert!(
+        matches!(
+            rider.effect.as_ref(),
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ),
+        "the rider must sacrifice SelfRef, got {:?}",
+        rider.effect
+    );
+}
+
+/// Issue #6507 SHAPE (typed-subject trigger sibling): Last Light of Durin's
+/// Day's rider — "If it has six or more quest counters on it, sacrifice it."
+/// — must bind to `SelfRef`, not `TriggeringSource` (pre-fix the anaphor
+/// rewriter bound the gated sacrifice to the triggering Mountain). The head
+/// clause's explicit "on this enchantment" binding must be untouched (guards
+/// against over-rewrite).
+#[test]
+fn typed_trigger_source_counter_rider_binds_self_ref_not_triggering_source() {
+    let text = "Whenever a Mountain you control enters, put a quest counter on this \
+                enchantment. If it has six or more quest counters on it, sacrifice it. If you \
+                do, search your hand and/or library for a Dragon card and put it onto the \
+                battlefield. If you search your library this way, shuffle.";
+    let parsed = parse(
+        text,
+        "Last Light of Durin's Day",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+
+    // Reach-guards: full trigger parse, zero warnings, zero Unimplemented.
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "expected zero parse warnings, got {:#?}",
+        parsed.parse_warnings
+    );
+    fn has_unimpl(def: &AbilityDefinition) -> bool {
+        matches!(def.effect.as_ref(), Effect::Unimplemented { .. })
+            || def.sub_ability.as_deref().is_some_and(has_unimpl)
+    }
+    assert_eq!(parsed.triggers.len(), 1);
+    let execute = parsed.triggers[0]
+        .execute
+        .as_deref()
+        .expect("trigger must carry an execute chain");
+    assert!(
+        !has_unimpl(execute),
+        "no Unimplemented anywhere in the trigger chain: {execute:#?}"
+    );
+
+    // Head clause: the explicit "on this enchantment" subject stays SelfRef.
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::PutCounter {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "the head counter placement must stay on the source, got {:?}",
+        execute.effect
+    );
+
+    let rider = execute
+        .sub_ability
+        .as_deref()
+        .expect("sacrifice sub-ability");
+    // CR 122.1: source-scoped quest-counter threshold gate.
+    assert_eq!(
+        rider.condition,
+        Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::CountersOn {
+                    scope: ObjectScope::Source,
+                    counter_type: Some(crate::types::counter::parse_counter_type("quest")),
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 6 },
+        })
+    );
+    // CR 608.2k: the gated "sacrifice it" anaphors to the source enchantment,
+    // NOT the triggering Mountain.
+    assert!(
+        matches!(
+            rider.effect.as_ref(),
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ),
+        "the rider must sacrifice SelfRef (the source), got {:?}",
+        rider.effect
+    );
+}
+
+/// Issue #6559 review regression guard: the source-counter arm must NOT fire
+/// when an EARLIER clause already chose a typed target. Revelation of Power
+/// (Instant): "Target creature gets +2/+2 until end of turn. If it has a counter
+/// on it, it also gains flying and lifelink until end of turn." Both bare "it"
+/// pronouns anaphor to the TARGET creature, but the intervening-if condition
+/// must be recipient-scoped instead of source-scoped. Binding the gated grant
+/// to the source (SelfRef) would drop flying/lifelink onto the one-shot Instant
+/// — the card would lose its second sentence (an `engine_regress`).
+/// `chain_has_prior_typed_referent` sees the prior "Target creature gets +2/+2"
+/// clause and suppresses the source binding, so the grant stays on the parent
+/// (target) creature. CR 608.2k only licenses a source anaphor when the ability's
+/// COST or TRIGGER CONDITION names the source — never a mid-effect intervening-if
+/// over a previously chosen target. The depletion-land / counter riders have no
+/// prior typed target, so their SelfRef heals are unaffected (see the two tests
+/// above).
+#[test]
+fn source_counter_gate_over_prior_target_keeps_parent_not_self_ref() {
+    let text = "Target creature gets +2/+2 until end of turn. If it has a counter on it, \
+                it also gains flying and lifelink until end of turn.";
+    let parsed = parse(text, "Revelation of Power", &[], &["Instant"], &[]);
+
+    // Reach-guards: the parse succeeded with zero warnings and zero Unimplemented,
+    // so the shape assertions below are not vacuous.
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "expected zero parse warnings, got {:#?}",
+        parsed.parse_warnings
+    );
+    fn has_unimpl(def: &AbilityDefinition) -> bool {
+        matches!(def.effect.as_ref(), Effect::Unimplemented { .. })
+            || def.sub_ability.as_deref().is_some_and(has_unimpl)
+    }
+    assert!(
+        !parsed.abilities.iter().any(has_unimpl),
+        "no Unimplemented anywhere in the parse: {:#?}",
+        parsed.abilities
+    );
+
+    // The flying/lifelink grant is the sub-ability of the +2/+2 pump.
+    let pump = &parsed.abilities[0];
+    assert!(
+        matches!(pump.effect.as_ref(), Effect::Pump { .. }),
+        "head effect is the +2/+2 pump, got {:?}",
+        pump.effect
+    );
+    let grant = pump
+        .sub_ability
+        .as_deref()
+        .expect("flying/lifelink grant sub-ability");
+    let Effect::GenericEffect {
+        static_abilities,
+        target,
+        ..
+    } = grant.effect.as_ref()
+    else {
+        panic!(
+            "grant must be a continuous GenericEffect, got {:?}",
+            grant.effect
+        );
+    };
+    // CR 608.2k: "it" = the prior chosen target creature (ParentTarget), never
+    // the source Instant (SelfRef).
+    assert_eq!(
+        *target,
+        Some(TargetFilter::ParentTarget),
+        "the grant's target must be the parent (target) creature, not the source Instant"
+    );
+    assert_eq!(static_abilities.len(), 1);
+    assert_eq!(
+        static_abilities[0].affected,
+        Some(TargetFilter::ParentTarget),
+        "the flying/lifelink continuous grant must affect the target creature (ParentTarget), \
+         not the source Instant (SelfRef) — the #6559 regression this guard prevents"
+    );
+    assert!(
+        matches!(
+            &static_abilities[0].condition,
+            Some(StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::Recipient,
+                        ..
+                    },
+                },
+                ..
+            })
+        ),
+        "the bare counter-condition pronoun must gate the recipient, got {:?}",
+        static_abilities[0].condition
+    );
+}
+
+/// CR 122.1 + CR 608.2c: A prior typed target does not rewrite an explicit
+/// source subject. This sibling keeps source-counter cards such as Gemstone
+/// Mine and Last Light of Durin's Day on their established Source scope.
+#[test]
+fn explicit_source_counter_gate_over_prior_target_stays_source_scoped() {
+    let parsed = parse(
+        "Target creature gets +2/+2 until end of turn. If this creature has a counter on it, \
+         it also gains flying until end of turn.",
+        "Explicit Source Counter Guard",
+        &[],
+        &["Creature"],
+        &[],
+    );
+
+    let rider = parsed.abilities[0]
+        .sub_ability
+        .as_deref()
+        .expect("conditional flying rider");
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = rider.effect.as_ref()
+    else {
+        panic!(
+            "explicit source-counter rider must be a GenericEffect, got {:?}",
+            rider.effect
+        );
+    };
+    assert_eq!(static_abilities.len(), 1);
+    assert!(
+        matches!(
+            &static_abilities[0].condition,
+            Some(StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        ..
+                    },
+                },
+                ..
+            })
+        ),
+        "explicit source text must retain CountersOn(Source), got {:?}",
+        static_abilities[0].condition
+    );
+}
+
 /// CR 104.2b + CR 104.3e + CR 114.1 + CR 611.3a + CR 205.3j: Gideon of the
 /// Trials (verbatim MTGJSON Oracle text) — the third loyalty ability creates
 /// an emblem carrying BOTH game-outcome locks, each gated on an `IsPresent`
