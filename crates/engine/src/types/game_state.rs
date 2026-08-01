@@ -11097,6 +11097,221 @@ impl WaitingFor {
     pub fn allows_cancel_cast(&self) -> bool {
         self.has_pending_cast() && !matches!(self, WaitingFor::ManaSourceSelection { .. })
     }
+
+    /// CR 603.3b / CR 603.3d / CR 603.5 + CR 608.2d / CR 903.9a / CR 704.5j / CR 310.10 /
+    /// CR 703.1 + CR 117.3a + CR 704.3: the windows the ENGINE forces open before the
+    /// next grant of priority. Two sources feed the class — the windows that open
+    /// between (or during) a resolution and the next priority, and the turn-based
+    /// actions CR 703.1 performs automatically when a step or phase begins or ends
+    /// ("Turn-based actions don't use the stack"), which CR 117.3a puts strictly
+    /// BEFORE the active player receives priority. **No player has priority at any of
+    /// them**, which is the single property every consumer relies on:
+    ///
+    /// * Answering one is never a *deliberate* break of a mandatory cascade — the
+    ///   player is being forced to make a choice, not choosing to act. That is why the
+    ///   CR 732.2a loop-detection ring is RETAINED across them rather than discarded.
+    /// * CR 704.3 checks state-based actions whenever a player *would* get priority,
+    ///   and every priority point arrives as [`WaitingFor::Priority`] — never a member
+    ///   here — so retaining across these windows skips no SBA check.
+    /// * Nothing can be cast or played here: casting a spell (CR 117.1a) and playing a
+    ///   land (CR 305.1) both require priority. This is what keeps a retained window's
+    ///   proved-empty cast set (`analysis::resource::LoopWindowScope::cast_card_ids`)
+    ///   sound.
+    ///
+    /// Members, with the rule that puts each one before priority:
+    /// * [`WaitingFor::OrderTriggers`] — CR 603.3b, ordering simultaneous triggers is a
+    ///   forced part of putting them on the stack (the pre-existing exemption).
+    /// * [`WaitingFor::TriggerTargetSelection`] — CR 603.3d, target choice is part of
+    ///   that same pre-priority step.
+    /// * [`WaitingFor::OptionalEffectChoice`] — CR 603.5 + CR 608.2d, a "may" pause
+    ///   happens mid-resolution.
+    /// * [`WaitingFor::CommanderZoneChoice`] — CR 903.9a, the commander-zone choice
+    ///   *is* a state-based action, and CR 704.3 checks SBAs before priority is granted.
+    /// * [`WaitingFor::ChooseLegend`] — CR 704.5j, the legend rule ("that player chooses
+    ///   one of them") *is* a state-based action, answered inside the same CR 704.3
+    ///   fixpoint before priority is granted.
+    /// * [`WaitingFor::BattleProtectorChoice`] — CR 310.10 (which says in so many words
+    ///   "This is a state-based action") + CR 704.5w / CR 704.5x, likewise answered
+    ///   inside the CR 704.3 fixpoint.
+    ///
+    /// Those SBA members (the commander-zone, legend and battle-protector choices) are
+    /// the COMPLETE set of player-choice pauses `game::sba` opens inside the SBA
+    /// fixpoint (`check_commander_zone_return`, `check_legend_rule`,
+    /// `check_battle_protector`) — that sub-class is derived from the enumeration, not
+    /// from a recollection of which ones happened to come up.
+    ///
+    /// TURN-BASED-ACTION members (CR 703.1 + CR 117.3a: "No player receives priority
+    /// during the untap step", and the active player receives priority only *after*
+    /// turn-based actions have been dealt with):
+    /// * [`WaitingFor::UntapChoice`] / [`WaitingFor::ChooseUntapSubset`] — CR 502.3,
+    ///   "the active player determines which permanents they control will untap ...
+    ///   This turn-based action doesn't use the stack", inside the untap step where
+    ///   CR 117.3a grants nobody priority at all.
+    /// * [`WaitingFor::DeclareAttackers`] — CR 508.1, "the active player declares
+    ///   attackers. This turn-based action doesn't use the stack"; priority arrives
+    ///   only afterwards at CR 508.2.
+    /// * [`WaitingFor::ExertChoice`] / [`WaitingFor::EnlistChoice`] — CR 508.1g, the
+    ///   optional "as it attacks" costs are chosen *within* that same CR 508.1
+    ///   declaration (CR 701.43d for exert, CR 702.154b for enlist).
+    /// * [`WaitingFor::DeclareBlockers`] — CR 509.1, "the defending player declares
+    ///   blockers. This turn-based action doesn't use the stack".
+    /// * [`WaitingFor::DiscardToHandSize`] — CR 514.1, "they discard enough cards to
+    ///   reduce their hand size to that number. This turn-based action doesn't use the
+    ///   stack", in the cleanup step where CR 514.3 normally grants no priority.
+    ///
+    /// What this class buys is RING SURVIVAL across a turn boundary, and that is
+    /// **necessary but not yet sufficient** for the cross-turn shortcut CR 732.2a
+    /// contemplates ("may even cross multiple turns"). Measured, on the Fantastic Four
+    /// dump: without these members the ring is force-wiped once per 99-beat turn period,
+    /// keyed on `DeclareAttackers` (with `DiscardToHandSize` masked behind it), holding
+    /// the ring at 2 frames; with them it accumulates to 13. That wipe is the concrete
+    /// defect this class removes.
+    ///
+    /// It does NOT by itself make a cross-turn pair certifiable, and this doc must not be
+    /// read as claiming so: `loop_states_equal` delegates to `impl PartialEq for
+    /// GameState`, which compares `turn_number`, `active_player` and `phase`, and neither
+    /// `normalize_for_loop` nor `analysis::resource::project_out_resources` neutralizes
+    /// any of the three. Measured on two retained frames one turn apart: self-vs-self
+    /// `true` (the positive control that the comparator is live), turn-bumped `false`,
+    /// phase-changed `false`. So no pair spanning a turn certifies today; the empty
+    /// normalization set is the deliberate, ratified design, and widening it is a
+    /// separate decision with its own soundness burden.
+    ///
+    /// A member missing from here is fail-closed but is still a class hole: a loop whose
+    /// cascade passes through that window can never accumulate a ring, so it can never
+    /// reach CR 732.2a detection.
+    ///
+    /// EXCLUDED BY THE CLASS'S OWN LIFE-MOVING PROHIBITION, not by a new carve-out:
+    /// [`WaitingFor::AssignCombatDamage`] and [`WaitingFor::AssignBlockerDamage`] are
+    /// turn-based per CR 510.1 / CR 510.1c / CR 510.1d, but CR 510.2 then deals that
+    /// damage with **no intervening priority** ("No player has the chance to cast
+    /// spells or activate abilities between the time combat damage is assigned and the
+    /// time it's dealt"). Exempting the assignment window therefore lets a retained
+    /// frame pair straddle the life change — exactly the case the existing prohibition
+    /// bars (`RedistributeLifeTotals` is out for the same reason; see
+    /// `forced_cascade_window_class` and the
+    /// `analysis::loop_check::winner_life_never_dips` invariant the exemption rests
+    /// on). A combat-damage loop consequently still fails to retain: a conservative
+    /// MISS, never a wrong certification.
+    ///
+    /// That window-keyed exclusion is **necessary but not sufficient**, and the
+    /// sufficient guard lives elsewhere: the assignment window opens ONLY when a damage
+    /// DIVISION choice is required (`game::combat_damage` auto-assigns for an unblocked
+    /// attacker, a single blocker, or a blocked attacker with no current blockers), so an
+    /// unblocked attacker deals CR 510.2 damage with **no window to exclude**. The
+    /// authority that covers that case is event-keyed, not window-keyed:
+    /// [`GameState::invalidate_loop_ring_on_unobserved_life_move`], called from
+    /// `game::combat_damage::apply_combat_damage` on the life delta the batch produced.
+    /// Both exclusions are kept: this one is a cheap upstream fence, the event-keyed one
+    /// is the complete one.
+    ///
+    /// ALSO EXCLUDED UNDER THE SAME RULE — [`WaitingFor::CombatTaxPayment`]. The
+    /// declaration windows above move no life, but CR 508.1h / CR 509.1d put the
+    /// declaration's COSTS in a separate sub-step ("Costs may include paying mana,
+    /// tapping permanents, sacrificing permanents, discarding cards, and so on"), and a
+    /// Phyrexian symbol in an attack or block tax is paid with 2 life (CR 107.4f) at
+    /// CR 508.1j / CR 509.1f — `game::engine_combat::handle_pay_combat_tax` pays through
+    /// `game::casting::pay_unless_cost`, which settles Phyrexian `life_payments` via
+    /// `game::life_costs::pay_life_as_cost`. So the tax window CAN move life and must
+    /// stay out, exactly as `RedistributeLifeTotals` does. It falls through to `false`
+    /// below and needs no arm; the [`CombatTaxContext`] anchor and the
+    /// `engine_combat::handle_declare_attackers` tax pause are where the class boundary
+    /// between "declaring" (a member) and "paying to declare" (not a member) is drawn.
+    ///
+    /// FAIL-CLOSED: the other 114 variants fall through to `false`, and `false` keeps
+    /// the ring-clearing behaviour, so a newly added variant defaults to the safe side
+    /// without anyone remembering to update this list.
+    pub fn is_forced_cascade_window(&self) -> bool {
+        matches!(
+            self,
+            WaitingFor::OrderTriggers { .. }
+                | WaitingFor::TriggerTargetSelection { .. }
+                | WaitingFor::OptionalEffectChoice { .. }
+                | WaitingFor::CommanderZoneChoice { .. }
+                | WaitingFor::ChooseLegend { .. }
+                | WaitingFor::BattleProtectorChoice { .. }
+                // CR 502.3 + CR 117.3a: the untap-step turn-based action; no player
+                // receives priority during the untap step at all.
+                | WaitingFor::UntapChoice { .. }
+                | WaitingFor::ChooseUntapSubset { .. }
+                // CR 508.1: declaring attackers is a turn-based action that doesn't use
+                // the stack; CR 508.2 grants priority only after it. CR 508.1g folds the
+                // optional "as it attacks" costs (CR 701.43d exert, CR 702.154b enlist)
+                // into that same declaration.
+                | WaitingFor::DeclareAttackers { .. }
+                | WaitingFor::ExertChoice { .. }
+                | WaitingFor::EnlistChoice { .. }
+                // CR 509.1: declaring blockers is likewise a turn-based action that
+                // doesn't use the stack.
+                | WaitingFor::DeclareBlockers { .. }
+                // CR 514.1 + CR 514.3: discarding to maximum hand size is the cleanup
+                // step's turn-based action, and no player normally gets priority there.
+                | WaitingFor::DiscardToHandSize { .. }
+        )
+    }
+
+    /// Look-at-top-N states whose legal selections cannot be captured by the
+    /// candidate enumerator (it lists only {empty, full-in-original-order,
+    /// singletons}), so the multiplayer legality gate would wrongly reject a
+    /// legal reordered or partial selection. For these, `apply()` is the real
+    /// validation boundary and validates the submitted selection structurally
+    /// (see handle_resolution_choice); the server bypasses its enumeration gate.
+    ///
+    /// - CR 701.22a / CR 701.25a: scry/surveil keep the chosen cards on top
+    ///   "in any order" — any duplicate-free subset, in any order, is legal.
+    /// - Dig (look at N, keep some): the handler enforces the keep_count /
+    ///   up_to constraint, uniqueness, and the selectable-cards filter, and
+    ///   preserves the chosen order for library-destined keeps.
+    pub fn accepts_freeform_card_selection(&self) -> bool {
+        matches!(
+            self,
+            WaitingFor::ScryChoice { .. }
+                | WaitingFor::ArrangePlanarDeckTopChoice { .. }
+                | WaitingFor::SurveilChoice { .. }
+                | WaitingFor::DigChoice { .. }
+        )
+    }
+
+    pub fn accepts_freeform_counter_move_distribution(&self) -> bool {
+        matches!(self, WaitingFor::MoveCountersDistribution { .. })
+    }
+
+    /// CR 107.1c: "Remove any number of counters" has a combinatorial legal
+    /// space (any per-type subset 0..=available, including the empty set) that
+    /// the coarse AI candidate enumerator (`counter_removal_candidates`, which
+    /// offers only "remove all" and "remove none") cannot fully cover. The
+    /// server bypasses its enumeration gate for this state so a human's
+    /// intermediate submission (e.g. "remove 2 of 3") is not wrongly rejected;
+    /// `apply()` (the `RemoveCountersChoice` handler) is the real validation
+    /// boundary via `validate_counter_selection`.
+    pub fn accepts_freeform_counter_removal(&self) -> bool {
+        matches!(self, WaitingFor::RemoveCountersChoice { .. })
+    }
+
+    /// Combat-damage assignment whose legal divisions cannot be captured by the
+    /// candidate enumerator. `candidates.rs` lists exactly one
+    /// `AssignCombatDamage` candidate (the greedy trample-through split), so the
+    /// multiplayer legality gate would wrongly reject every other legal division
+    /// — e.g. keeping excess on the blocker instead of trampling it through
+    /// (CR 702.19b), or any of the freely-chosen splits across multiple blockers
+    /// (CR 510.1c/d). The combinatorial space of legal divisions is too large to
+    /// enumerate, so `apply()` (handle_assign_combat_damage) is the real
+    /// validation boundary: it enforces total conservation, blocker membership,
+    /// and the CR 702.19b lethal-before-excess precondition, and rejects illegal
+    /// submissions. The server bypasses its enumeration gate for these.
+    pub fn accepts_freeform_combat_damage_assignment(&self) -> bool {
+        matches!(self, WaitingFor::AssignCombatDamage { .. })
+    }
+
+    /// CR 510.1d + CR 702.22k: A blocker's free division of its combat damage
+    /// among the attackers it blocks cannot be captured by the candidate
+    /// enumerator (the combinatorial space of legal divisions is too large to
+    /// enumerate), so the server bypasses its enumeration gate for this state
+    /// and `apply()` (handle_assign_blocker_damage) is the real validation
+    /// boundary: it enforces total conservation and blocked-attacker membership.
+    pub fn accepts_freeform_blocker_damage_assignment(&self) -> bool {
+        matches!(self, WaitingFor::AssignBlockerDamage { .. })
+    }
 }
 
 /// CR 102.1 + CR 500.1: which turn boundary ends an auto-pass session.
@@ -18584,6 +18799,57 @@ impl GameState {
         self.loop_detect_ring.push_back(snapshot);
     }
 
+    /// CR 510.2 + CR 704.3 + CR 704.5a + CR 732.2a: drop the loop-detection ring when a
+    /// turn-based action moved a life total with NO intervening priority.
+    ///
+    /// CR 510.2 deals assigned combat damage with "No player has the chance to cast
+    /// spells or activate abilities between the time combat damage is assigned and the
+    /// time it's dealt", so the resulting life change is a CR 704.5a point that no
+    /// CR 704.3 check (which arrives only as [`WaitingFor::Priority`]) separates from the
+    /// retained frames. Two frames straddling it would be compared as if the life
+    /// movement had been observed, which is what
+    /// `analysis::loop_check::winner_life_never_dips` relies on being impossible.
+    ///
+    /// Keyed on the EVENT — the life delta the batch actually produced — and NOT on a
+    /// [`WaitingFor`] variant. The window-keyed exclusion of
+    /// [`WaitingFor::AssignCombatDamage`] / [`WaitingFor::AssignBlockerDamage`] from
+    /// [`WaitingFor::is_forced_cascade_window`] is necessary but NOT sufficient: that
+    /// window opens only when a damage DIVISION choice is required (`game::combat_damage`
+    /// auto-assigns for an unblocked attacker, a single blocker, or a blocked attacker
+    /// with no current blockers), so an unblocked attacker moves a life total with no
+    /// window at all. An event-keyed guard covers every life-moving sub-path of the
+    /// batch — CR 120.3a damage, CR 702.15b lifelink, and a CR 615.5 prevention rider —
+    /// including ones added later.
+    ///
+    /// CR 119.3 adjusts a life total in EITHER direction, hence `!=` rather than `<`: a
+    /// batch that both drains and lifelinks back inside one CR 510.2 event is exactly the
+    /// dip-and-recover shape this prohibition exists to bar.
+    ///
+    /// Fail-safe by construction: clearing can only SHRINK the prior set every
+    /// offer/crown/draw path is gated on (`game::engine::find_live_loop_winner` and the
+    /// Path-B / Path-C bridges all scan `loop_detect_ring` for a satisfying prior), so
+    /// this can produce a conservative MISS and never a wrong certification.
+    ///
+    /// `lives_before` is positional over `self.players`, the fixed seat vector — seats are
+    /// never removed (elimination sets `Player::is_eliminated`) and the sole caller
+    /// snapshots the same vector inside one call, so the lengths agree today. A LENGTH
+    /// mismatch is nevertheless treated as an unobserved move: `zip` truncates to the
+    /// shorter slice, so a short snapshot would silently skip tail seats and RETAIN the
+    /// ring — the one direction the "clearing can only SHRINK the prior set" guarantee
+    /// forbids. One comparison keeps that guarantee structural instead of contractual.
+    /// (CR 119.3, `MagicCompRules.txt:1065`, is the rule the life comparison implements.)
+    pub(crate) fn invalidate_loop_ring_on_unobserved_life_move(&mut self, lives_before: &[i32]) {
+        if self.players.len() != lives_before.len()
+            || self
+                .players
+                .iter()
+                .zip(lives_before)
+                .any(|(p, &before)| p.life != before)
+        {
+            self.loop_detect_ring.clear();
+        }
+    }
+
     /// CR 732.2a: record that an unbounded (net-progress) loop under `controller`
     /// pumps `axes`. The single write authority for `unbounded_resources` —
     /// every producer routes through here, never mutating the map inline. Two
@@ -19744,6 +20010,308 @@ mod active_search_provenance_tests {
 /// serialized `WaitingFor::SeparatePiles*` states).
 fn default_pile_source_battlefield() -> PileSource {
     PileSource::Battlefield
+}
+
+#[cfg(test)]
+mod forced_cascade_window_tests {
+    use super::*;
+
+    fn certificate() -> crate::analysis::loop_check::LoopCertificate {
+        crate::analysis::loop_check::LoopCertificate {
+            unbounded: vec![crate::analysis::resource::ResourceAxis::Life(PlayerId(1))],
+            win_kind: crate::analysis::loop_check::WinKind::LethalDamage,
+            mandatory: false,
+            residual_board_delta: crate::analysis::resource::BoardDelta::default(),
+        }
+    }
+
+    /// CR 603.3b / CR 603.3d / CR 603.5 + CR 608.2d / CR 903.9a / CR 704.5j /
+    /// CR 310.10 / CR 703.1 + CR 117.3a: the membership matrix for
+    /// [`WaitingFor::is_forced_cascade_window`], asserted in BOTH directions —
+    /// thirteen members and eight non-members, each named.
+    ///
+    /// The class is defined by "no player has priority here", and each half of the
+    /// matrix pins a different consequence:
+    ///
+    /// * The TRUE half is what lets the CR 732.2a loop-detection ring survive a
+    ///   forced pre-priority window and the action that answers it. Its SBA members
+    ///   are the complete enumeration of `game::sba`'s in-fixpoint player choices;
+    ///   its CR 703.1 turn-based members are the ones a turn boundary is paved with
+    ///   (CR 502.3 untap, CR 508.1/508.1g attackers, CR 509.1 blockers, CR 514.1
+    ///   cleanup discard). Keeping the ring alive across those is **necessary but not
+    ///   yet sufficient** for the cross-turn shortcut CR 732.2a contemplates ("may even
+    ///   cross multiple turns"): `loop_states_equal` still compares `turn_number`, so no
+    ///   cross-turn pair certifies today. What the membership buys, measured, is that the
+    ///   Fantastic Four dump stops force-wiping the ring once per 99-beat turn period at
+    ///   declare-attackers (2 frames held → 13). A missing member is fail-closed but is a
+    ///   class hole, because a cascade passing through it can never accumulate a ring and
+    ///   so can never reach CR 732.2a detection.
+    /// * The FALSE half is load-bearing for soundness, not tidiness.
+    ///   `Priority{..}` must stay out: every point at which a CR 704.5a
+    ///   state-based action can fire arrives as `Priority` (CR 704.3), so admitting
+    ///   it would break the "every such point either samples or clears the ring"
+    ///   invariant that `analysis::loop_check::winner_life_never_dips` rests on.
+    ///   That invariant is the whole reason the per-resolution sampler's three
+    ///   outcomes (SAMPLE at `Priority{active}`, RETAIN at a forced window, CLEAR
+    ///   everywhere else) are sound: it needs only DISJOINTNESS of `Priority` from
+    ///   the retained class, never the false claim that consecutive ring frames are
+    ///   consecutive resolutions. Both priority seats are asserted, since the
+    ///   non-active seat is the sampler's clear arm.
+    ///   `RedistributeLifeTotals` must stay out because it is a window that CAN
+    ///   MOVE LIFE — a life-moving window may never be exempt, or a retained frame
+    ///   pair could straddle an unobserved life change. `AssignCombatDamage` is out
+    ///   under that SAME rule even though CR 510.1 makes it turn-based: CR 510.2
+    ///   deals the assigned damage with "no player has the chance to cast spells or
+    ///   activate abilities" in between, so no priority separates the window from the
+    ///   life change it causes. `CombatTaxPayment` is out under that same rule and is
+    ///   the sharpest case, because the window it interrupts (`DeclareAttackers`) IS a
+    ///   member: CR 508.1j / CR 509.1f make paying to declare a separate sub-step, and
+    ///   a Phyrexian tax symbol is paid with 2 life (CR 107.4f). Declaring moves no
+    ///   life; paying to declare can. `LoopShortcut` /
+    ///   `RespondToShortcut` must stay out because their answers
+    ///   (`DeclareShortcut` / `RespondToShortcut`) are deliberate protocol actions
+    ///   whose ring-clear the bounded drive depends on.
+    ///
+    /// NON-VACUITY: neither half is empty, so a constant implementation (always
+    /// `true` or always `false`) fails one of the two loops. REVERT-PROBE: adding
+    /// `Priority{..}` to the `matches!` flips the `Priority` rows here AND breaks
+    /// the sampler invariant; adding `RedistributeLifeTotals` or
+    /// `AssignCombatDamage` flips its row here; dropping ANY of the thirteen members
+    /// — SBA or turn-based — flips that member's TRUE row here (each was observed to
+    /// panic individually).
+    ///
+    /// This row owns the RULES invariant only. Runtime WIRING — that the sampler and
+    /// `apply_action` really consult this predicate — is proved by
+    /// `loop_shortcut.rs::two_site_retention_survives_a_prompt_and_its_answer`, and
+    /// that no exempt window admits a cast by
+    /// `analysis::resource`'s `no_exempt_window_admits_a_cast`.
+    #[test]
+    fn forced_cascade_window_class() {
+        let forced: Vec<(&str, WaitingFor)> = vec![
+            (
+                "OrderTriggers (CR 603.3b, the shipped exemption)",
+                WaitingFor::OrderTriggers {
+                    player: PlayerId(0),
+                    triggers: Vec::new(),
+                },
+            ),
+            (
+                "TriggerTargetSelection (CR 603.3d)",
+                WaitingFor::TriggerTargetSelection {
+                    player: PlayerId(0),
+                    trigger_controller: None,
+                    trigger_event: None,
+                    trigger_events: Vec::new(),
+                    target_slots: Vec::new(),
+                    mode_labels: Vec::new(),
+                    target_constraints: Vec::new(),
+                    selection: Default::default(),
+                    source_id: None,
+                    description: None,
+                },
+            ),
+            (
+                "OptionalEffectChoice (CR 603.5 + CR 608.2d)",
+                WaitingFor::OptionalEffectChoice {
+                    player: PlayerId(0),
+                    source_id: ObjectId(1),
+                    description: None,
+                    may_trigger_key: None,
+                },
+            ),
+            (
+                "CommanderZoneChoice (CR 903.9a — it IS a state-based action)",
+                WaitingFor::CommanderZoneChoice {
+                    player: PlayerId(0),
+                    commander_id: ObjectId(2),
+                    current_zone: Zone::Graveyard,
+                },
+            ),
+            (
+                "ChooseLegend (CR 704.5j — the legend rule IS a state-based action)",
+                WaitingFor::ChooseLegend {
+                    player: PlayerId(0),
+                    legend_name: "Delianfel, Prayerful Herald".to_string(),
+                    candidates: vec![ObjectId(3), ObjectId(4)],
+                },
+            ),
+            (
+                "BattleProtectorChoice (CR 310.10 + CR 704.5w / CR 704.5x — likewise an SBA)",
+                WaitingFor::BattleProtectorChoice {
+                    player: PlayerId(0),
+                    battle_id: ObjectId(5),
+                    candidates: vec![PlayerId(1)],
+                },
+            ),
+            (
+                "UntapChoice (CR 502.3 turn-based + CR 117.3a — no priority in the untap step)",
+                WaitingFor::UntapChoice {
+                    player: PlayerId(0),
+                    candidates: vec![ObjectId(6)],
+                    chosen_not_to_untap: Vec::new(),
+                },
+            ),
+            (
+                "ChooseUntapSubset (CR 502.3 bounded untap choice, same no-priority step)",
+                WaitingFor::ChooseUntapSubset {
+                    player: PlayerId(0),
+                    group: vec![ObjectId(6), ObjectId(7)],
+                    max: 1,
+                },
+            ),
+            (
+                "DeclareAttackers (CR 508.1 turn-based; CR 508.2 grants priority only after)",
+                WaitingFor::DeclareAttackers {
+                    player: PlayerId(0),
+                    valid_attacker_ids: Vec::new(),
+                    valid_attack_targets: Vec::new(),
+                    valid_attack_targets_by_attacker: None,
+                    attacker_constraints: Default::default(),
+                },
+            ),
+            (
+                "ExertChoice (CR 508.1g optional attack cost + CR 701.43d, inside CR 508.1)",
+                WaitingFor::ExertChoice {
+                    player: PlayerId(0),
+                    attacker: ObjectId(8),
+                    remaining: Vec::new(),
+                },
+            ),
+            (
+                "EnlistChoice (CR 508.1g optional attack cost + CR 702.154b, inside CR 508.1)",
+                WaitingFor::EnlistChoice {
+                    player: PlayerId(0),
+                    attacker: ObjectId(8),
+                    eligible: vec![ObjectId(9)],
+                    remaining: Vec::new(),
+                },
+            ),
+            (
+                "DeclareBlockers (CR 509.1 turn-based, doesn't use the stack)",
+                WaitingFor::DeclareBlockers {
+                    player: PlayerId(0),
+                    valid_blocker_ids: Vec::new(),
+                    valid_block_targets: Default::default(),
+                    block_requirements: Default::default(),
+                    blocker_constraints: Default::default(),
+                },
+            ),
+            (
+                "DiscardToHandSize (CR 514.1 turn-based + CR 514.3 — no priority in cleanup)",
+                WaitingFor::DiscardToHandSize {
+                    player: PlayerId(0),
+                    count: 1,
+                    cards: vec![ObjectId(10)],
+                },
+            ),
+        ];
+
+        let not_forced: Vec<(&str, WaitingFor)> = vec![
+            (
+                "Priority{active} — CR 704.3 SBA point, must sample or clear",
+                WaitingFor::Priority {
+                    player: PlayerId(0),
+                },
+            ),
+            (
+                "Priority{non-active} — same, and the ring-clearing arm",
+                WaitingFor::Priority {
+                    player: PlayerId(1),
+                },
+            ),
+            (
+                "RedistributeLifeTotals — a window that CAN MOVE LIFE",
+                WaitingFor::RedistributeLifeTotals {
+                    player: PlayerId(0),
+                    options: Vec::new(),
+                },
+            ),
+            (
+                "AssignCombatDamage — turn-based (CR 510.1) but CR 510.2 deals the damage \
+                 with no intervening priority, so it MOVES LIFE",
+                WaitingFor::AssignCombatDamage {
+                    player: PlayerId(0),
+                    attacker_id: ObjectId(11),
+                    total_damage: 2,
+                    blockers: Vec::new(),
+                    assignment_modes: Vec::new(),
+                    trample: None,
+                    defending_player: PlayerId(1),
+                    attack_target: crate::game::combat::default_attack_target(),
+                    pw_loyalty: None,
+                    pw_controller: None,
+                },
+            ),
+            (
+                "AssignBlockerDamage — same CR 510.1d / CR 510.2 life-moving exclusion",
+                WaitingFor::AssignBlockerDamage {
+                    player: PlayerId(0),
+                    blocker_id: ObjectId(12),
+                    total_damage: 2,
+                    attackers: vec![ObjectId(11)],
+                },
+            ),
+            (
+                "CombatTaxPayment — CR 508.1j / CR 509.1f put the declaration's COSTS in a \
+                 separate sub-step, and a Phyrexian tax symbol is paid with 2 life \
+                 (CR 107.4f), so it MOVES LIFE and must stay OUT even though the \
+                 DeclareAttackers window it interrupts is a member",
+                WaitingFor::CombatTaxPayment {
+                    player: PlayerId(0),
+                    context: CombatTaxContext::Attacking,
+                    // The life-moving shape itself: {W/P} is payable with 2 life
+                    // (CR 107.4f), which is what makes this window a life-mover.
+                    total_cost: crate::types::mana::ManaCost::Cost {
+                        shards: vec![crate::types::mana::ManaCostShard::PhyrexianWhite],
+                        generic: 0,
+                    },
+                    per_creature: Vec::new(),
+                    pending: CombatTaxPending::Attack {
+                        attacks: Vec::new(),
+                        bands: Vec::new(),
+                    },
+                },
+            ),
+            (
+                "LoopShortcut — answered by the deliberate DeclareShortcut",
+                WaitingFor::LoopShortcut {
+                    proposer: PlayerId(0),
+                    predicted_winner: Some(PlayerId(0)),
+                    certificate: certificate(),
+                    schema: Default::default(),
+                },
+            ),
+            (
+                "RespondToShortcut — answered by the deliberate RespondToShortcut",
+                WaitingFor::RespondToShortcut {
+                    player: PlayerId(1),
+                    remaining_players: Vec::new(),
+                    proposal: crate::analysis::loop_check::ShortcutProposal {
+                        proposer: PlayerId(0),
+                        predicted_winner: Some(PlayerId(0)),
+                        count: crate::analysis::decision_template::IterationCount::UntilLethal,
+                        unbounded: vec![crate::analysis::resource::ResourceAxis::Life(PlayerId(1))],
+                        win_kind: crate::analysis::loop_check::WinKind::LethalDamage,
+                        template: None,
+                    },
+                },
+            ),
+        ];
+
+        assert!(
+            !forced.is_empty() && !not_forced.is_empty(),
+            "both halves must be populated — a one-sided matrix is satisfiable by a constant"
+        );
+        for (why, wf) in &forced {
+            assert!(
+                wf.is_forced_cascade_window(),
+                "{why} is a forced pre-priority window and must be a member"
+            );
+        }
+        for (why, wf) in &not_forced {
+            assert!(!wf.is_forced_cascade_window(), "{why} must NOT be a member");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -25362,5 +25930,82 @@ mod tests {
             "an unknown group must report that nothing was removed"
         );
         assert_eq!(state.transient_continuous_effects.len(), 1);
+    }
+
+    /// GAP 3 — `invalidate_loop_ring_on_unobserved_life_move` must treat a SHORT
+    /// `lives_before` snapshot as an unobserved move. `zip` truncates to the shorter
+    /// slice, so without the length disjunct a short snapshot silently skips the tail
+    /// seats and RETAINS the ring — the one direction the doc's "clearing can only
+    /// SHRINK the prior set" guarantee forbids. (CR 119.3 is the rule the life
+    /// comparison implements.)
+    ///
+    /// The second arm is the ZERO-CENSUS POSITIVE CONTROL: a FULL-length snapshot with
+    /// EQUAL lives must RETAIN, which proves the instrument can return "not cleared" and
+    /// that arm 1's clear is a verdict rather than an unconditional wipe.
+    ///
+    /// REVERT-PROBE: delete `self.players.len() != lives_before.len() ||` ⇒ arm 1's `zip`
+    /// yields nothing over the tail, `any` is false, the ring survives ⇒ arm 1 FAILS while
+    /// arm 2 still passes, so the probe is isolated to the length disjunct.
+    #[test]
+    fn unobserved_life_move_invalidates_on_a_short_snapshot() {
+        let seed = |state: &mut GameState| {
+            state.record_loop_detect_sample();
+            assert!(
+                !state.loop_detect_ring.is_empty(),
+                "reach-guard: the ring must be seeded, else both arms below are vacuous"
+            );
+        };
+
+        // ── ARM 1 (SUBJECT): a SHORT snapshot whose covered prefix AGREES on life ──
+        let mut short_state = GameState::new_two_player(7);
+        assert!(
+            short_state.players.len() >= 2,
+            "reach-guard: the board needs a tail seat for a short snapshot to skip"
+        );
+        seed(&mut short_state);
+        let short: Vec<i32> = vec![short_state.players[0].life];
+        assert!(
+            short.len() < short_state.players.len(),
+            "reach-guard: the snapshot really is SHORT — this is the whole premise"
+        );
+        assert_eq!(
+            short_state.players[0].life, short[0],
+            "reach-guard: the COVERED prefix agrees on life, so a `zip`-only comparison \
+             finds no difference and the clear below can only come from the length test"
+        );
+        short_state.invalidate_loop_ring_on_unobserved_life_move(&short);
+        assert!(
+            short_state.loop_detect_ring.is_empty(),
+            "a SHORT `lives_before` cannot prove the tail seats did not move, so the ring \
+             must be dropped; `zip` would silently truncate and retain it"
+        );
+
+        // ── ARM 2 (POSITIVE CONTROL): FULL length, EQUAL lives ⇒ RETAINED ──
+        let mut equal_state = GameState::new_two_player(7);
+        seed(&mut equal_state);
+        let full: Vec<i32> = equal_state.players.iter().map(|p| p.life).collect();
+        assert_eq!(
+            full.len(),
+            equal_state.players.len(),
+            "reach-guard: this arm's snapshot is FULL length"
+        );
+        equal_state.invalidate_loop_ring_on_unobserved_life_move(&full);
+        assert!(
+            !equal_state.loop_detect_ring.is_empty(),
+            "positive control: a full-length snapshot with unchanged lives observed NO \
+             move, so the ring must be RETAINED — this is what proves arm 1's clear is a \
+             verdict and not an unconditional wipe"
+        );
+
+        // ── ARM 3: FULL length, a life that MOVED ⇒ cleared (the pre-existing contract) ──
+        let mut moved_state = GameState::new_two_player(7);
+        seed(&mut moved_state);
+        let before: Vec<i32> = moved_state.players.iter().map(|p| p.life).collect();
+        moved_state.players[1].life -= 1;
+        moved_state.invalidate_loop_ring_on_unobserved_life_move(&before);
+        assert!(
+            moved_state.loop_detect_ring.is_empty(),
+            "an observed life move on a full-length snapshot still clears the ring"
+        );
     }
 }
