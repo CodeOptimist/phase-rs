@@ -4869,6 +4869,7 @@ mod tests {
                 win_kind: engine::analysis::loop_check::WinKind::LethalDamage,
                 mandatory: false,
                 residual_board_delta: engine::analysis::resource::BoardDelta::default(),
+                per_cycle: None,
             },
             schema: engine::analysis::decision_template::ShortcutDecisionSchema::default(),
         };

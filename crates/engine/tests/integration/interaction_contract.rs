@@ -2358,6 +2358,7 @@ fn loop_shortcut_zero_max_iterations_is_rejected_not_clamped() {
                 win_kind: engine::analysis::loop_check::WinKind::LethalDamage,
                 mandatory: false,
                 residual_board_delta: engine::analysis::resource::BoardDelta::default(),
+                per_cycle: None,
             },
             schema: engine::analysis::decision_template::ShortcutDecisionSchema {
                 iteration_count: engine::analysis::decision_template::IterationCount::Fixed(2),
@@ -2417,6 +2418,7 @@ fn loop_shortcut_narrowed_max_iterations_bounds_the_picker() {
             win_kind: engine::analysis::loop_check::WinKind::LethalDamage,
             mandatory: false,
             residual_board_delta: engine::analysis::resource::BoardDelta::default(),
+            per_cycle: None,
         },
         schema: engine::analysis::decision_template::ShortcutDecisionSchema {
             // A NARROWED bound, i.e. what `elimination_bounds` produces on a real board.
@@ -2465,6 +2467,7 @@ fn loop_shortcut_number_schema_accepts_a_fixed_count_above_one() {
             win_kind: engine::analysis::loop_check::WinKind::LethalDamage,
             mandatory: false,
             residual_board_delta: engine::analysis::resource::BoardDelta::default(),
+            per_cycle: None,
         },
         schema: engine::analysis::decision_template::ShortcutDecisionSchema {
             iteration_count: engine::analysis::decision_template::IterationCount::Fixed(2),
@@ -2519,10 +2522,11 @@ fn loop_shortcut_schema_and_materializer_cover_every_decision_point_kind() {
             win_kind: engine::analysis::loop_check::WinKind::Advantage,
             mandatory: false,
             residual_board_delta: engine::analysis::resource::BoardDelta::default(),
+            per_cycle: None,
         },
         schema: ShortcutDecisionSchema {
             iteration_count: IterationCount::Fixed(2),
-            // No narrowed CR 732.2a bound — the global cap, as every offer states today.
+            // No narrowed CR 732.2a bound — `Default` carries the global cap.
             max_iterations: ShortcutDecisionSchema::default().max_iterations,
             points: vec![
                 DecisionPoint {
