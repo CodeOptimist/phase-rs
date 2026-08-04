@@ -15187,6 +15187,29 @@ mod stage2_injector_tests {
                 //     and the other two did NOT move, which located the insertion below them.
                 //   #6961 (2ead7aab1) + v0.44.0: `:5918/:5995/:8970 ⇒ :5996/:6073/:9048`,
                 //     uniform +78 above all three (whole-file delta +153/-15).
+                //   #6957 (this branch, base 4f524c6014): `:5999/:6076/:9051 ⇒
+                //     `:6061/:6138/:9113`, uniform +62 above all three. The two hunks above
+                //     them are `-3` (the `matches!(scope, PlayerFilter::All)` gate replaced by
+                //     a named local) and `+65` (`scope_keeps_scoped_whole_hand_shuffle_local`
+                //     and its doc comment); every other hunk in the file is at `:27733+`, i.e.
+                //     BELOW all three. Identity re-established, not assumed: each producer is
+                //     sha256-identical to `4f524c6014:effects/mod.rs` at its old coordinate.
+                //   #6956 (same branch, second unit): `:9113 ⇒ :9243`, +130, and ONLY that
+                //     entry moved — the other four stayed byte-identical AND in place, which is
+                //     the set-preservation evidence. The +109 is the
+                //     zero-policy pair inserted at `:7030` (+131, minus a 1-line comment
+                //     reflow at `:7020`), i.e. below `:6061`/`:6138` and above `:9113`. The
+                //     only other hunks are in `mod tests`. Producer sha256-identical at its
+                //     new coordinate.
+                //   #6956 fix round (review round 1): `:6061/:6138/:9243 ⇒ :6065/:6142/:9324`,
+                //     +4 above the first two and +81 above the third. The +4 is the
+                //     `AllExcept` recursion arm added to
+                //     `scope_keeps_scoped_whole_hand_shuffle_local`; the further +77 is the
+                //     `amount_channel` classifier that collapses the twin `_ => 0` / `_ => false`
+                //     registry, plus the relay guard. All three producers sha256-identical at
+                //     their new coordinates AND still inside the same enclosing functions
+                //     (`drive_sequential_repeated_optional_payment` ×2, `resolve_chain_body`),
+                //     which is stronger evidence than the coordinate alone.
                 //
                 // ⚠ THIS ROW FAILS IN CI BEFORE IT FAILS LOCALLY, and that is not a bug in the
                 // row. CI checks out `refs/pull/<n>/merge` — this branch merged with CURRENT
@@ -15199,9 +15222,9 @@ mod stage2_injector_tests {
                 // because that is what makes a NEW mint a counted event; a function +
                 // content-hash anchor would end the drift class while keeping that property,
                 // and is offered as a follow-up rather than taken unannounced mid-review.
-                "game/effects/mod.rs:5999".to_string(),
-                "game/effects/mod.rs:6076".to_string(),
-                "game/effects/mod.rs:9051".to_string(),
+                "game/effects/mod.rs:6065".to_string(),
+                "game/effects/mod.rs:6142".to_string(),
+                "game/effects/mod.rs:9324".to_string(),
                 // UNMOVED across the rebase, and that is itself evidence the SET did not
                 // move: a census that had gained or lost a producer would not leave this
                 // entry both byte-identical AND at the same coordinate.
