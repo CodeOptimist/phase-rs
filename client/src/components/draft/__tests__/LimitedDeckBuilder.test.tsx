@@ -1,8 +1,10 @@
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { LimitedDeckBuilder } from "../LimitedDeckBuilder";
+
+afterEach(cleanup);
 
 vi.mock("../../../stores/draftStore", () => ({
   useDraftStore: (selector: (state: Record<string, unknown>) => unknown) =>
@@ -44,7 +46,7 @@ const TEST_VIEW: BuilderView = {
   cards_per_pack: 14,
   pack_count: 3,
   min_deck_size: 40,
-  addable_cards: ["Plains", "Island", "Swamp", "Mountain", "Forest"],
+  addable_cards: ["Plains", "Island", "Academy Ruins"],
   timer_remaining_ms: null,
   standings: [],
   current_round: 0,
@@ -88,5 +90,17 @@ describe("LimitedDeckBuilder", () => {
     fireEvent.click(screen.getByRole("button", { name: /wind drake/i }));
 
     expect(threeDropBucket).toHaveAttribute("aria-valuenow", "1");
+  });
+
+  it("filters custom addable cards by name", () => {
+    render(<Harness />);
+
+    fireEvent.change(screen.getByPlaceholderText("Search addable cards..."), {
+      target: { value: "academy" },
+    });
+
+    expect(screen.getByText("Academy Ruins")).toBeInTheDocument();
+    expect(screen.queryByText("Plains")).not.toBeInTheDocument();
+    expect(screen.queryByText("Island")).not.toBeInTheDocument();
   });
 });

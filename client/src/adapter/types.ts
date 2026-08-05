@@ -2114,6 +2114,7 @@ export type DebugAction =
         zone: Zone;
         attach_to?: AttachTarget;
         run_etb: boolean;
+        nonlegendary: boolean;
       };
     }
   | { type: "RemoveObject"; data: { object_id: ObjectId } }
@@ -2148,7 +2149,10 @@ export type DebugAction =
         run_etb: boolean;
       };
     }
-  | { type: "CreateTokenCopy"; data: { source_id: ObjectId; owner: PlayerId } };
+  | {
+      type: "CreateTokenCopy";
+      data: { source_id: ObjectId; owner: PlayerId; nonlegendary: boolean };
+    };
 
 // CR 117.3d: priority-yield preference types, mirroring the engine's
 // `YieldScope` / `YieldTarget` / `PriorityYieldOp` / `PriorityYield`. The
