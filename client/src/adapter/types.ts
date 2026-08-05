@@ -2846,6 +2846,12 @@ export interface DerivedViews {
    * of every unbounded-resource loop. Empty/omitted when no loop is active. The
    * FE maps each axis to a display family and never re-derives attribution.
    * Mirrors `engine::game::derived_views::DerivedViews::unbounded_resources`.
+   *
+   * This channel and its two siblings below stay POPULATED after all players accept a
+   * shortcut, until the engine applies the growth at the next CR 500.5 boundary. Deferring
+   * the application across that window is an engine deviation, pre-existing and deliberate.
+   * What matters to the FE is only that the mark and its enablers are still live there, so
+   * `∞` is current engine state, not a stale mark. Render it.
    */
   unbounded_resources?: UnboundedResourceView[];
   /**

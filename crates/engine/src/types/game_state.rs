@@ -3526,17 +3526,19 @@ pub enum PersistentAxisMaterialization {
 
 /// CR 732.2a: the `unbounded_resources` axis a counter of `ct` on `obj_id` backs — mirrors
 /// `ResourceVector::snapshot`'s `(CounterClass, ObjectClass)` keying. SINGLE mapping from a
-/// counter target to its axis, shared by `scheduled_collapse_axes`,
-/// `clear_collapsed_materializations`' surviving-target guard, and the ∞ counter-pill
-/// projection in `game::derived_views`.
+/// counter target to its axis, with exactly three production call sites, all in this file:
+/// `scheduled_collapse_axes`, and `clear_collapsed_materializations`' surviving-target guard
+/// (twice). The ∞ counter-pill projection in `game::derived_views` is NOT one of them — it
+/// projects the battlefield-surviving entries of `unbounded_counter_targets` directly and
+/// never maps them to an axis.
 ///
 /// LIVE RE-DERIVATION — DELIBERATE DISPLAY-ONLY TOLERANCE. The class is read from the
 /// object as it stands NOW, not snapshotted at accept. `state.objects` retains an object
 /// across an ordinary zone change, so the `Other` fallback is reached only when the bearer
 /// truly stopped existing, or when its printed types changed under CR 400.7. In that window
-/// the derived axis becomes `Counter(_, Other)`, which is not the axis `unbounded_resources`
-/// holds ⇒ the pill/badge is NOT hidden and the `∞` renders for a collapse that is still
-/// scheduled.
+/// the derived axis becomes `Counter(_, Other)`, which joins no axis `unbounded_resources`
+/// holds ⇒ the boundary's removal finds nothing to take away and the row keeps rendering `∞`
+/// one boundary longer than it should. Nothing is ever hidden by the miss.
 ///
 /// CENSUS (`grep -rn 'objects.remove' crates/`, `#[cfg(test)]` bodies excluded) — FOUR
 /// production removes, not one. Cease-to-exist (`zones::…replay_resolved_object_cease`,
@@ -3552,19 +3554,16 @@ pub enum PersistentAxisMaterialization {
 /// Two further removes operate on DISCARDED COMPARISON CLONES, never live state
 /// (`game::engine::normalize_recast_frame`, `analysis::resource`'s frame projection).
 ///
-/// REACHABILITY BY CONSUMER (the fallback is not uniformly live):
-///   • the ∞ counter-PILL projection in `game::derived_views` — UNREACHABLE. That loop
-///     `continue`s on `!state.battlefield.contains(id)` before calling this, and every
-///     production remove above deletes from the zone set before `objects` (or never touches
-///     a battlefield permanent at all), so a battlefield id is present in `state.objects`.
-///   • `scheduled_collapse_axes` (both its `derived_views` hide-set caller and its
-///     `clear_collapsed_materializations` caller) and that function's surviving-target guard
-///     — LIVE, and byte-identical to the pre-extraction nested `counter_axis` helper they
-///     already used. The hide-set case is exactly the fail-open described above.
+/// REACHABILITY BY CONSUMER — with the pill projection no longer mapping to an axis, both
+/// remaining consumers are LIVE, and byte-identical to the pre-extraction nested
+/// `counter_axis` helper they already used:
+///   • `scheduled_collapse_axes` — read by `clear_collapsed_materializations` to pick the
+///     removals. Exactly the fail-open described above: a removal that finds nothing.
+///   • `clear_collapsed_materializations`' own surviving-target guard.
 ///
 /// That fail-open polarity is the SAME one this phase mandates everywhere else (an axis
-/// with no registration renders ∞): it can only ever show an extra ∞ for at most the
-/// accept→CR-500.5-boundary window, never hide a real one. A snapshot would have to add a
+/// with no registration renders ∞): it can only ever leave an ∞ standing one boundary longer
+/// than it should — never hide a real one. A snapshot would have to add a
 /// serde field to `CounterGrowth` — a saved-game surface change across every construction
 /// site — to buy a strictly-display improvement, so it is not taken. Removing a non-present
 /// axis stays a harmless no-op, and `clear_collapsed_materializations`' surviving-target
@@ -19755,7 +19754,8 @@ impl GameState {
         entry.extend(axes.iter().copied());
     }
 
-    /// CR 104.4b / CR 110.1: single write authority for `unbounded_loop_enablers` —
+    /// Single write authority for `unbounded_loop_enablers` (an engine bookkeeping map; no CR
+    /// mandates it) —
     /// only the Interactive B5 bridge arm (`interactive_loop_bridge` Path C) calls
     /// this. Overwrites (idempotent re-registration each re-detection beat with the
     /// same stable board). A no-op for an empty set (nothing to defuse on later).
@@ -19834,26 +19834,33 @@ impl GameState {
     }
 
     /// CR 732.2a: the exact `ResourceAxis` set a deferred materialization stash will
-    /// collapse at the next CR 500.5 boundary. SINGLE AUTHORITY, with exactly two callers:
-    /// - `clear_collapsed_materializations` REMOVES these axes once the growth was applied;
-    /// - `game::derived_views::derive_views` HIDES their `∞` HUD rows while the collapse is
-    ///   merely SCHEDULED. CR 732.2c fixes the finite N at accept, so the axis is already
-    ///   bounded — rendering `∞ Life` beside a finite, growing life total is a lie.
+    /// collapse at the next CR 500.5 boundary. SINGLE AUTHORITY with ONE production caller,
+    /// `clear_collapsed_materializations`, which REMOVES these axes once the growth was applied.
+    ///
+    /// NOT a display filter, and deliberately not read by `game::derived_views`. This stash is the
+    /// engine's DEFERRAL of an accepted shortcut's results — an engine deviation, pre-existing and
+    /// deliberate, that no CR licenses. The count itself is already fixed at accept
+    /// (`pending_materialization_count`); what is deferred is putting the growth on the board.
+    /// While it is pending, the `∞` HUD rows, the ∞ object pile and the ∞ counter pills all keep
+    /// projecting, because the marks and their enablers are still live. This set says nothing
+    /// about them — it names what the boundary will REMOVE, not what the display may show.
     ///
     /// Returns the axes UNFILTERED, including any `Mana(_)` a `DriveSequence` names, because the
-    /// `clear_collapsed_materializations` caller MUST remove that axis at the boundary. The
-    /// `derive_views` caller drops `Mana(_)` from its hide-set on the way out: mana is already
-    /// materialized in the pool (`mana_payment::refill_infinite_mana` re-tops it off this very
-    /// store until CR 500.5 empties it), so it is the one axis that must keep rendering `∞`
-    /// while a collapse is merely scheduled. See the class rule at that call site.
+    /// caller MUST remove that axis at the boundary. Note the two axis classes end their `∞` by
+    /// different routes: `Tokens` / `Counters` / `Life` are DEFERRED and end here, when the
+    /// boundary applies the growth; a `Mana(_)` is already materialized in the pool
+    /// (`mana_payment::refill_infinite_mana` re-tops it off this very store) and its `∞` ends at
+    /// the CR 500.5 step/phase end instead.
     ///
-    /// Hiding in the PROJECTION rather than removing from the store is load-bearing:
-    /// the store keeps `unbounded_resources` and `unbounded_loop_enablers` in CR 104.4b /
-    /// CR 110.1 lockstep, which is what `zones::apply_zone_exit_cleanup` reads to defuse a
-    /// capability whose enabler leaves between accept and boundary.
+    /// Removing at the boundary rather than filtering the store meanwhile is load-bearing:
+    /// the store keeps `unbounded_resources` and `unbounded_loop_enablers` in lockstep — an
+    /// ENGINE-STATE invariant required by no CR, held for exactly one consumer:
+    /// `zones::apply_zone_exit_cleanup` reads the enabler map to defuse a capability whose
+    /// enabler leaves between accept and boundary.
     ///
     /// FAIL-CLOSED: only an axis some REGISTERED item actually collapses is returned, so an
-    /// ∞ axis with no registration (a mana engine registers nothing) keeps its badge.
+    /// ∞ axis with no registration (a mana engine registers nothing) is never removed here —
+    /// it keeps its badge until CR 500.5 ends it.
     /// EXHAUSTIVE over `PersistentAxisMaterialization` (no wildcard) — a future variant
     /// build-breaks here instead of silently leaking a stale `∞`.
     pub fn scheduled_collapse_axes(
@@ -19914,7 +19921,7 @@ impl GameState {
     /// `DriveSequence` CAN name one (its `collapsed_axes` is the loop's whole `proposal.unbounded`
     /// set) and then removing it here is correct — that loop's mana really did end with it.
     /// Drops `unbounded_resources[controller]`
-    /// (and its `unbounded_loop_enablers` entry in CR 104.4b/CR 110.1 lockstep, mirroring
+    /// (and its `unbounded_loop_enablers` entry in engine-state lockstep, mirroring
     /// `clear_unbounded_mana_loop`) only when its axis set becomes empty. Always removes
     /// the whole `pending_unbounded_materialization` list (owned by `take_` at the submit
     /// site). Leaves `clear_unbounded_mana_loop` / `clear_unbounded_loop` untouched.
@@ -19924,8 +19931,8 @@ impl GameState {
         collapsed: &[PersistentAxisMaterialization],
     ) {
         // --- Phase 1 (reads): what to remove ---
-        // The axis set comes from the SHARED authority the ∞-row projection also reads, so
-        // "hidden while scheduled" and "removed once applied" can never disagree.
+        // The axis set comes from `scheduled_collapse_axes`, so "what a stash schedules" and
+        // "what is removed once applied" are one match, never two copies of it.
         let mut axes_to_remove = self.scheduled_collapse_axes(collapsed);
         // The token pile drops exactly when the token axis collapses — true for a batched
         // `Tokens` item and for a `DriveSequence` that names `TokensCreated`.
@@ -19986,7 +19993,7 @@ impl GameState {
             axes.retain(|a| !axes_to_remove.contains(a));
             if axes.is_empty() {
                 self.unbounded_resources.remove(&controller);
-                self.unbounded_loop_enablers.remove(&controller); // CR 104.4b / CR 110.1 lockstep
+                self.unbounded_loop_enablers.remove(&controller); // engine-state lockstep
             }
         }
         self.pending_unbounded_materialization.remove(&controller);
@@ -19996,7 +20003,8 @@ impl GameState {
     /// CR 500.5 + CR 106.4: end a loop-backed ∞-mana capability at a step/phase boundary — an
     /// AXIS-SCOPED clear, not the whole-player `clear_unbounded_loop`. Removes every
     /// `ResourceAxis::Mana(_)` axis from `unbounded_resources`. If that empties the player's axis
-    /// set, drop the player key AND its `unbounded_loop_enablers` entry IN LOCKSTEP (CR 104.4b / CR 110.1):
+    /// set, drop the player key AND its `unbounded_loop_enablers` entry IN LOCKSTEP (an engine-state
+    /// invariant, not a rules requirement):
     /// enablers track the PRESENCE of any unbounded axis, and the `zones.rs` defuse hook
     /// (`apply_zone_exit_cleanup`, `:534`–`:544`) whole-clears a controller's capability when ANY
     /// enabler leaves. Leaving enablers orphaned (no backing axis) is a landmine — a later
@@ -20011,7 +20019,7 @@ impl GameState {
             axes.retain(|a| !matches!(a, ResourceAxis::Mana(_)));
             if axes.is_empty() {
                 self.unbounded_resources.remove(&controller);
-                self.unbounded_loop_enablers.remove(&controller); // CR 104.4b / CR 110.1 lockstep-iff-empty
+                self.unbounded_loop_enablers.remove(&controller); // engine-state lockstep-iff-empty
             }
         }
     }
@@ -23449,12 +23457,21 @@ mod tests {
         );
     }
 
-    /// PR-7 Phase 4c (B5 defuse): `clear_unbounded_loop` must remove ALL THREE
-    /// `unbounded_resources` / `unbounded_loop_enablers` / `unbounded_loop_pile`
-    /// maps for the controller in lockstep — the `zones.rs` defuse hook relies on
-    /// a single call revoking the whole capability.
+    /// PR-7 Phase 4c (B5 defuse): `clear_unbounded_loop` must remove ALL SIX per-controller
+    /// maps in lockstep — `unbounded_resources` / `unbounded_loop_enablers` /
+    /// `unbounded_loop_pile` / `unbounded_counter_targets` /
+    /// `pending_unbounded_materialization` / `pending_materialization_count`. The `zones.rs`
+    /// defuse hook relies on a single call revoking the whole capability.
+    ///
+    /// The last two are why this call is NOT a display clear and must never be wired to an
+    /// object-growth mark: dropping the stash and its CR 732.2c bound cancels growth every
+    /// player already accepted. Anything that only wants to stop RENDERING an ∞ belongs at
+    /// the projection (`derived_views::object_growth_backing`), not here.
+    ///
+    /// (Renamed from `..._removes_both_maps_in_lockstep`: the old name said TWO and the old
+    /// body asserted THREE, while the function has cleared six since the stash landed.)
     #[test]
-    fn clear_unbounded_loop_removes_both_maps_in_lockstep() {
+    fn clear_unbounded_loop_removes_all_six_maps_in_lockstep() {
         let mut state = GameState::new_two_player(7);
         state.mark_unbounded_loop(
             PlayerId(0),
@@ -23462,9 +23479,28 @@ mod tests {
         );
         state.register_unbounded_loop_enablers(PlayerId(0), BTreeSet::from([ObjectId(1)]));
         state.register_unbounded_loop_pile(PlayerId(0), BTreeSet::from([ObjectId(1)]));
+        state.register_unbounded_counter_targets(
+            PlayerId(0),
+            vec![(ObjectId(1), CounterType::Generic("charge".to_string()))],
+        );
+        state.register_pending_materialization(
+            PlayerId(0),
+            PersistentAxisMaterialization::Life {
+                player: PlayerId(0),
+                per_cycle_delta: 1,
+            },
+        );
+        state.pending_materialization_count.insert(PlayerId(0), 7);
         assert!(state.unbounded_resources.contains_key(&PlayerId(0)));
         assert!(state.unbounded_loop_enablers.contains_key(&PlayerId(0)));
         assert!(state.unbounded_loop_pile.contains_key(&PlayerId(0)));
+        assert!(state.unbounded_counter_targets.contains_key(&PlayerId(0)));
+        assert!(state
+            .pending_unbounded_materialization
+            .contains_key(&PlayerId(0)));
+        assert!(state
+            .pending_materialization_count
+            .contains_key(&PlayerId(0)));
 
         state.clear_unbounded_loop(PlayerId(0));
 
@@ -23479,6 +23515,22 @@ mod tests {
         assert!(
             !state.unbounded_loop_pile.contains_key(&PlayerId(0)),
             "clear_unbounded_loop must remove the unbounded_loop_pile entry"
+        );
+        assert!(
+            !state.unbounded_counter_targets.contains_key(&PlayerId(0)),
+            "clear_unbounded_loop must remove the unbounded_counter_targets entry"
+        );
+        assert!(
+            !state
+                .pending_unbounded_materialization
+                .contains_key(&PlayerId(0)),
+            "clear_unbounded_loop must remove the accepted-collapse stash entry"
+        );
+        assert!(
+            !state
+                .pending_materialization_count
+                .contains_key(&PlayerId(0)),
+            "clear_unbounded_loop must remove the CR 732.2c accepted-count bound"
         );
     }
 
