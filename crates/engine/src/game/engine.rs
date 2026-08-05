@@ -1408,16 +1408,23 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
     // stack, so the sampler clears the ring at that beat and the `!stack.is_empty()` bridge
     // is structurally unreachable for it. Detect it here by driving the captured loop-action
     // sequence on a clone. Gated identically (opt-in + top-level-only) plus a cheap
-    // `last_loop_action_sequence` precondition (non-empty only on a buyback-paid token-creating
+    // `last_loop_action_sequence` precondition (armed only on a buyback-paid token-creating
     // cast or a multi-activation engine's accumulated beats — so the clone-drive runs ~never for
     // the recast class; a mana engine arms per mana activation but its drive aborts fast when
     // unsustainable). INV-2: this OFFERS the interactive shortcut (never auto-resolves — CR 732.2a).
+    //
+    // SITE A (CR 732.2a): the precondition asks whose period it is, not merely whether one exists.
+    // BEHAVIOUR-PRESERVING by construction — `try_offer_object_growth_shortcut` below applies the
+    // identical whole-period test to its own admission and returns `None` for a foreign period, so
+    // this conjunct only stops paying for a clone-drive whose answer is already known. It reads the
+    // same authority as that consumer so the two cannot drift apart.
     if !matches!(state.waiting_for, WaitingFor::GameOver { .. })
         && matches!(state.waiting_for, WaitingFor::Priority { .. })
         && state.stack.is_empty()
         && state.loop_detection.samples()
         && !in_simulation_probe()
-        && !state.last_loop_action_sequence.is_empty()
+        && matches!(state.waiting_for, WaitingFor::Priority { player }
+            if state.loop_period_controller() == Some(player))
     {
         if let Some((certificate, schema)) = try_offer_object_growth_shortcut(state) {
             let WaitingFor::Priority { player: proposer } = state.waiting_for else {
@@ -1742,9 +1749,13 @@ fn build_cert(
 pub enum BoundedOfferRefusal {
     /// (1) Not a `WaitingFor::Priority` beat, so nobody may suggest a shortcut.
     NotAtPriority,
-    /// (1b) A non-empty `last_loop_action_sequence` routes an accepted proposal to the
-    /// object-growth materializer, which commits zero bounded cycles.
-    DrivingSequenceNotEmpty,
+    /// (1b) A driving period belonging to the PROPOSER'S OWN seat is accumulating, which routes
+    /// an accepted proposal to the object-growth materializer — it would commit zero bounded
+    /// cycles. Another seat's period is not a reason to refuse (CR 732.2a): it describes no
+    /// sequence this proposer can take, and `try_offer_object_growth_shortcut` will not admit it
+    /// either. Named for the state that refuses, not for a non-emptiness test the conjunct
+    /// stopped applying when it went seat-relative.
+    ProposerHasDrivingPeriod,
     /// (2) The priority holder is not the active player the ring sampler gates on.
     ProposerIsNotActivePlayer,
     /// (4) Neither certification basis matched.
@@ -1774,8 +1785,10 @@ pub enum BoundedOfferRefusal {
 /// * `predicted_winner: None` — this seam never calls `live_mandatory_loop_winner`, so it
 ///   neither consults nor weakens the CR 104.2a crown gate (`loop_check.rs`'s
 ///   `nonfallers.len() != 1`); it routes around it.
-/// * an EMPTY `last_loop_action_sequence` (step 1b) — the object-growth producer's class is
+/// * no driving period of the PROPOSER'S OWN (step 1b) — the object-growth producer's class is
 ///   the complement, and `materialize_fixed_shortcut` dispatches on that same discriminant.
+///   Seat-relative, not merely non-empty: a period recorded by another seat admits no
+///   object-growth offer either, so it is not the complement of anything (CR 732.2a).
 ///
 /// Returns the offer to write, or the FIRST conjunct that refused. Pure: it reads `state` and
 /// writes nothing. The refusal is typed rather than a bare `None` because nine fail-closed
@@ -1887,16 +1900,29 @@ fn bounded_cycle_offer(
         return Err(BoundedOfferRefusal::NotAtPriority);
     };
     // (1b) The bounded drain mints nothing, so it is reachable in `materialize_fixed_shortcut`
-    // ONLY below that function's object-growth dispatch — and that dispatch is an EARLY
-    // RETURN gated on `!state.last_loop_action_sequence.is_empty()`. An offer minted with a
-    // non-empty sequence would be accepted and routed to the object-growth materializer,
-    // committing ZERO bounded cycles and making this whole path silently dead. The two
-    // conjuncts are not disjoint — a mana activation arms a period and a same-controller
-    // on-stack activation both appends to it and leaves the stack non-empty, which is the
-    // bridge's own entry condition — so this guard is load-bearing, not a restatement of an
+    // ONLY below that function's object-growth dispatch — and that dispatch is an EARLY RETURN
+    // taken when the recorded period belongs to the accepting proposal's proposer. An offer minted
+    // while THIS proposer's own period is accumulating would be accepted and routed to the
+    // object-growth materializer, committing ZERO bounded cycles and making this whole path
+    // silently dead. The two conjuncts are not disjoint — a mana activation arms a period and a
+    // same-controller on-stack activation both appends to it and leaves the stack non-empty, which
+    // is the bridge's own entry condition — so this guard is load-bearing, not a restatement of an
     // invariant. It converts a silent misroute into an observable refusal.
-    if !state.last_loop_action_sequence.is_empty() {
-        return Err(BoundedOfferRefusal::DrivingSequenceNotEmpty);
+    //
+    // SITE B (CR 732.2a) — THE SEAT-RELATIVE FORM. The test is whose period is recorded, not
+    // whether one exists. CR 732.2a describes a shortcut as "a sequence of game choices … that may
+    // be legally taken based on the current game state and the predictable results of the sequence
+    // of choices": a period recorded from a DIFFERENT seat's independent activation describes no
+    // sequence this proposer can take, so it is no reason to refuse their own predictable one. One
+    // opponent activation used to refuse a proposer's certified bounded offer for the rest of the
+    // game. `loop_period_controller()` is `None` for a heterogeneous run, which also mints — and
+    // that is sound in the same direction, because `try_offer_object_growth_shortcut` fail-closes
+    // on heterogeneity too, so no object-growth offer can exist to be misrouted to.
+    //
+    // (CR 732.3's fragmented-loop rule is NOT what this guard ever enforced — the engine
+    // implements no CR 732.3 gate anywhere; see the contrast note under step (2).)
+    if state.loop_period_controller() == Some(proposer) {
+        return Err(BoundedOfferRefusal::ProposerHasDrivingPeriod);
     }
     // (2) The ring sampler gates on `Priority{active_player}`, so requiring the proposer to
     // BE the active player is what establishes they held priority at every sampled frame.
@@ -2137,11 +2163,22 @@ fn certified_bounded_cycle_offer<'a>(
     // So the discriminant is a FIRE-TIME CONDITION READING A PROJECTED AXIS, not the shape of
     // the resources the loop moves. And the composition worth remembering: gate (5)'s
     // `scope.cast_card_ids` relief — which exists precisely to excuse a self-cost modifier on
-    // a card the window provably never casts — CANNOT fire for this class, because step (1b)
-    // requires `last_loop_action_sequence` to be EMPTY, so `window_cast_card_ids` returns
-    // `None` (no proof ⇒ scan everything). The requirement that DEFINES the bounded class is
-    // exactly what disables the relief that would otherwise let cover succeed. Two
-    // individually-correct constraints composing into a refusal neither intended.
+    // a card the window provably never casts — CANNOT fire for this class, and the CONCLUSION is
+    // unchanged by the seat-relative (1b), but the REASON is not the one recorded here before.
+    //
+    // ⚠ STALE REASON, CORRECTED. This block used to say the relief cannot fire "because step (1b)
+    // requires `last_loop_action_sequence` to be EMPTY". Step (1b) no longer requires that: it
+    // refuses only when the recorded period is the PROPOSER'S OWN, so a bounded offer can now be
+    // minted with a FOREIGN period sitting in state. What preserves the conclusion is instead
+    // `window_cast_card_ids`, which is proposer-scoped: when the verdict container names a
+    // proposer, only that seat's own period is proof of what the window casts, so a foreign period
+    // yields `None` (no proof ⇒ scan everything) exactly as an empty one does. Without that
+    // scoping an OPPONENT'S choice of which card to activate would select which soundness relief
+    // applies to this proposer's certification — relief in the forbidden direction. This block is
+    // the reasoning record for precisely that (1b) × gate-(5) composition, which is why the reason
+    // is corrected here rather than left to be re-derived.
+    //
+    // Two individually-correct constraints still compose into a refusal neither intended.
     //
     // ⚠ NEVER attribute the basis from `frames_per_period`. BOTH bases now MEASURE it — basis A
     // from the certifying prior's ring index above, basis B from `ring_delta_signature`'s
@@ -3026,7 +3063,19 @@ fn apply_until_lethal_shortcut(
     let period = shortcut_drive_period(proposal.template.as_ref());
 
     // DRIVE one representative cycle to produce the measured post-drive `work` state.
-    let work: GameState = if !committed.last_loop_action_sequence.is_empty() {
+    //
+    // SITE D (CR 732.2a): drive the recorded period ONLY when it is this proposal's proposer's
+    // own. Under `!is_empty()` a foreign seat's independent activation sitting in state would make
+    // this branch drive THAT seat's period and measure its delta as if it were the proposal's —
+    // CR 732.2a binds a shortcut to the choices its proposer can predictably take, and another
+    // seat's period is not among them. Fails closed on `None` into the ring-boundary branch below,
+    // which reads no sequence at all.
+    //
+    // ⚠ PRE-EXISTING AND INDEPENDENT OF the (1b) fix: Path A (`interactive_loop_bridge`'s
+    // ring-gated offer) never reads the sequence, so a Path-A `UntilLethal` offer accepted while a
+    // foreign period sat in state already reached here and drove the wrong seat. No fixture reaches
+    // that path today; the guard is the one-line root-cause fix through the same authority.
+    let work: GameState = if committed.loop_period_controller() == Some(proposal.proposer) {
         // Object-growth loop period (recast buyback+convoke, or a multi-activation mana engine)
         // declared `UntilLethal` by the AI (which hardcodes it for every optional offer). Drive
         // one real period on a clone under the re-entrancy guard; an inert Advantage token/mana
@@ -3045,7 +3094,7 @@ fn apply_until_lethal_shortcut(
         match drive_loop_sequence_iteration(&mut w, &seq, 0, &expected_defs) {
             Ok(()) => w,
             Err(RecastAbort) => {
-                return until_lethal_fallback(state, result, committed);
+                return until_lethal_fallback(state, result, committed, proposal.proposer);
             }
         }
     } else {
@@ -3091,12 +3140,12 @@ fn apply_until_lethal_shortcut(
                         };
                         result.waiting_for = state.waiting_for.clone();
                     } else {
-                        until_lethal_fallback(state, result, committed);
+                        until_lethal_fallback(state, result, committed, proposal.proposer);
                     }
                     return;
                 }
                 CycleOutcome::Abort => {
-                    return until_lethal_fallback(state, result, committed);
+                    return until_lethal_fallback(state, result, committed, proposal.proposer);
                 }
             }
         }
@@ -3124,12 +3173,12 @@ fn apply_until_lethal_shortcut(
                     &fallers,
                 )
             {
-                until_lethal_fallback(state, result, committed);
+                until_lethal_fallback(state, result, committed, proposal.proposer);
             } else {
                 crown_until_lethal(state, result, proposal, winner);
             }
         }
-        _ => until_lethal_fallback(state, result, committed),
+        _ => until_lethal_fallback(state, result, committed, proposal.proposer),
     }
 }
 
@@ -3178,16 +3227,34 @@ fn crown_until_lethal(
 /// loop-detect ring so this same `apply()` does not instantly re-offer the (now-declined)
 /// loop; a later beat re-detects genuinely. Mirrors the `materialize_fixed_shortcut` abort
 /// tail.
-fn until_lethal_fallback(state: &mut GameState, result: &mut ActionResult, committed: GameState) {
+///
+/// THE SEQUENCE CLEAR IS OWNERSHIP-SCOPED (CR 732.2a) — the same authority, and for the same
+/// reason, as `handle_decline_shortcut`'s. `*state = committed` restores the PRE-DRIVE board,
+/// which since the bounded mint's step (1b) went seat-relative can carry a period belonging to a
+/// seat other than this proposal's proposer; an unconditional clear then destroyed that seat's
+/// accumulating period as a side effect of somebody else's aborted drive. Scoping costs the
+/// suppression below nothing, because `try_offer_object_growth_shortcut` returns `None` for every
+/// period that is not the priority holder's — so the only period whose survival could re-fire the
+/// offer this fallback is walking away from is the proposer's own, which this branch still clears.
+fn until_lethal_fallback(
+    state: &mut GameState,
+    result: &mut ActionResult,
+    committed: GameState,
+    proposer: PlayerId,
+) {
     *state = committed;
     // CR 732.2c: a declined shortcut must not instantly re-offer the SAME loop in this same
     // `apply()`. Clear both re-offer signals: the drain offer's `loop_detect_ring` AND the
     // object-growth offer's `last_loop_action_sequence` routing signal (a non-drain object-growth
     // loop, e.g. an AI-declared UntilLethal on an inert Advantage recast, would otherwise
     // re-fire `try_offer_object_growth_shortcut` on the next reconcile and livelock). A later
-    // real re-cast re-captures the sequence and re-detects genuinely.
+    // real re-cast re-captures the sequence and re-detects genuinely. The ring is a board-wide
+    // sampler with no seat semantics, so it clears unconditionally; the period is evidence about
+    // the seat that recorded it, so only the proposer's own is theirs to discard.
     state.loop_detect_ring.clear();
-    state.last_loop_action_sequence.clear();
+    if state.loop_period_controller() == Some(proposer) {
+        state.last_loop_action_sequence.clear();
+    }
     priority::reset_priority(state);
     state.waiting_for = WaitingFor::Priority {
         player: living_priority_seat(state),
@@ -3696,7 +3763,17 @@ fn materialize_fixed_shortcut(
     // plus the `cr733/authority_matrix` census fixture that pins its composition. (Only a
     // PARALLEL per-item bound VECTOR would be positionally unsyncable across that sort; that
     // is the shape being rejected here, not per-accept binding as such.)
-    if !state.last_loop_action_sequence.is_empty() {
+    //
+    // SITE C (CR 732.2a) — MANDATORY IN LOCKSTEP WITH SITE B. Route to the object-growth
+    // materializer only when the recorded period belongs to THIS proposal's proposer, which is
+    // exactly the admission `try_offer_object_growth_shortcut` required to mint the offer being
+    // materialized. Under `!is_empty()` the seat-relative (1b) above would let a bounded drain
+    // offer be accepted while a FOREIGN period sits in state; this early return would then fire
+    // and commit ZERO bounded cycles — the precise silent misroute (1b)'s own doc block exists to
+    // prevent, reintroduced through the back door. Fails closed on `None` into the drain path
+    // below, which is correct because a heterogeneous period cannot have minted an object-growth
+    // offer in the first place.
+    if state.loop_period_controller() == Some(proposal.proposer) {
         let stashed_before = state
             .pending_unbounded_materialization
             .get(&proposal.proposer)
@@ -4600,7 +4677,14 @@ fn try_offer_object_growth_shortcut(
     // The whole PERIOD must belong to the priority holder. A multi-controller / interleaved
     // sequence is fail-closed here; the per-step drive's controller re-find is the runtime
     // backstop (T-HET). Faithful generalization of the pre-P7 `ctx.controller != caster` check.
-    if seq.iter().any(|c| c.controller != caster) {
+    //
+    // CR 732.2a: this admission test IS `loop_period_controller`, and reads it rather than
+    // re-implementing it. That is the whole point of the hoist — the ROUTING sites (the bridge
+    // precondition, the bounded mint's (1b), the two materialize/drive dispatches, the declare
+    // arm) all route to THIS consumer, so a routing signal coarser than this admission is an
+    // in-tree contradiction: it sends a foreign period down a path that then refuses it. Sharing
+    // one authority closes that by construction instead of by parallel edits.
+    if state.loop_period_controller() != Some(caster) {
         return None;
     }
     // STEP D (CR 104.4b / CR 601.2a / CR 602.2 / CR 605.3a): only OFFER a VOLUNTARILY-repeatable
@@ -5198,11 +5282,21 @@ fn handle_declare_shortcut(
             // is legitimate for exactly one drive shape: the object-growth route, which
             // re-derives its template from `state.last_loop_action_sequence` (the same routing
             // discriminant `materialize` dispatches on) and never reads `proposal.template`.
-            // With an EMPTY sequence there is nothing to re-derive from, so a pin-consuming
-            // drive would run with no pins at all — fail closed into the same manual-play
-            // handback the validation failure above uses. Both conjuncts are required: keying
-            // on `template.is_none()` alone breaks the shipped object-growth declarations.
-            None if state.last_loop_action_sequence.is_empty() => {
+            // With nothing this proposer can re-derive from, a pin-consuming drive would run with
+            // no pins at all — fail closed into the same manual-play handback the validation
+            // failure above uses. Both conjuncts are required: keying on `template.is_none()`
+            // alone breaks the shipped object-growth declarations.
+            //
+            // SITE F (CR 732.2a) — THE STRICTEST LOCKSTEP CONSTRAINT ON SITE B, because it is the
+            // one direction in which relaxing (1b) would make the engine LESS safe than before.
+            // "Re-derivable" means the period is THIS offer's proposer's own — the same test
+            // `materialize` dispatches on. A merely non-empty test would let a FOREIGN period take
+            // the sibling `None => {}` arm, which performs ZERO pin validation, and open the APNAP
+            // window on a client-supplied declaration against a schema with published points. So
+            // this arm must reject unless the period is the proposer's, not merely unless one
+            // exists. `None` from a heterogeneous run also rejects, which is the fail-closed
+            // direction: nothing can be re-derived from a period that is nobody's.
+            None if state.loop_period_controller() != Some(offer.proposer) => {
                 reject_shortcut_declaration(state, &mut result);
                 return Ok(result);
             }
@@ -5260,16 +5354,31 @@ fn handle_declare_shortcut(
 ///   the ring (re-clearing would special-case `DeclineShortcut` to distrust an engine-wide
 ///   invariant). The interactive e2e's "no re-offer" assertion guards this end-to-end: a future
 ///   regression excluding `DeclineShortcut` from that allowlist would fail it loudly.
-/// - Object-growth (Seam 2, gated by `!last_loop_action_sequence.is_empty()`): the deliberate-action
-///   clear does NOT touch `last_loop_action_sequence`, so `state.last_loop_action_sequence.clear()` here
-///   is the genuinely load-bearing suppressor — without it the post-return reconcile re-fires
-///   `try_offer_object_growth_shortcut` within this same `apply()`.
+/// - Object-growth (Seam 2, gated by `loop_period_controller() == Some(caster)` — the whole-period
+///   admission test, NOT mere non-emptiness): the deliberate-action clear does NOT touch
+///   `last_loop_action_sequence`, so clearing it here is the genuinely load-bearing suppressor —
+///   without it the post-return reconcile re-fires `try_offer_object_growth_shortcut` within this
+///   same `apply()`.
+///
+/// THE SEAM-2 CLEAR IS OWNERSHIP-SCOPED (CR 732.2a). Once the bounded mint's step (1b) went
+/// seat-relative, a `WaitingFor::LoopShortcut` can coexist with a period belonging to a DIFFERENT
+/// seat — and `DeclineShortcut` dispatches from any `LoopShortcut`, so an unconditional clear would
+/// let one seat's decline wipe another seat's accumulating period and suppress THAT seat's own
+/// offer until it re-armed. A recorded period is evidence about the seat that recorded it, so only
+/// the decliner's own is theirs to discard. Scoping costs the suppression NOTHING, and the reason
+/// is `try_offer_object_growth_shortcut`'s own admission test rather than an argument about who
+/// receives priority next: that producer returns `None` for every period that is not the priority
+/// holder's, so the only period whose survival could re-fire it is the one this branch still
+/// clears. A period left in place is one no reconcile in this `apply()` can turn back into an
+/// offer for anybody.
 ///
 /// A genuine re-recurrence or a fresh re-cast re-arms the offer naturally. Proposer-only
 /// authorization is enforced upstream by `check_actor_authorization`
-/// (`WaitingFor::acting_player` == `LoopShortcut.proposer`), so offer fields are unused here.
+/// (`WaitingFor::acting_player` == `LoopShortcut.proposer`), so the offer's other fields are
+/// unused here; `proposer` is threaded in solely as the ownership comparand above.
 fn handle_decline_shortcut(
     state: &mut GameState,
+    proposer: PlayerId,
     events: &mut Vec<GameEvent>,
 ) -> Result<ActionResult, EngineError> {
     let mut result = ActionResult {
@@ -5278,8 +5387,11 @@ fn handle_decline_shortcut(
         log_entries: vec![],
     };
     // Seam 1 (loop_detect_ring) is already invalidated by apply_action's deliberate-action
-    // ring-clear (engine.rs:3006-3011) — see doc. Only Seam 2 is the handler's gap:
-    state.last_loop_action_sequence.clear(); // Seam 2: load-bearing object-growth offer-gate clear (CR 732.2a)
+    // ring-clear (engine.rs:3006-3011) — see doc. Only Seam 2 is the handler's gap, and only
+    // for the decliner's OWN period (CR 732.2a):
+    if state.loop_period_controller() == Some(proposer) {
+        state.last_loop_action_sequence.clear();
+    }
     priority::reset_priority(state);
     state.waiting_for = WaitingFor::Priority {
         player: living_priority_seat(state),
@@ -8388,10 +8500,11 @@ fn apply_action(
             );
         }
         // CR 732.2a: the proposer DECLINES the offered shortcut (suggesting is optional).
-        // Proposer-only authorization is enforced upstream by `check_actor_authorization`, so
-        // `proposer`/`certificate`/`schema` are unused here (`..`).
-        (WaitingFor::LoopShortcut { .. }, GameAction::DeclineShortcut) => {
-            return handle_decline_shortcut(state, &mut events);
+        // Proposer-only authorization is enforced upstream by `check_actor_authorization`;
+        // `certificate`/`schema` stay unused (`..`), but `proposer` is threaded because the
+        // handler's Seam-2 suppression clear is OWNERSHIP-SCOPED to that seat.
+        (WaitingFor::LoopShortcut { proposer, .. }, GameAction::DeclineShortcut) => {
+            return handle_decline_shortcut(state, *proposer, &mut events);
         }
         // The finite pre-cast protocol is intentionally isolated from the
         // legacy generic loop-shortcut handlers above.
@@ -15404,7 +15517,9 @@ mod stage2_injector_tests {
                 //     this one ran FIRST and both fired GREEN on the run that caught this —
                 //     total still **37**, partition still **5/7/25** — and the other two
                 //     entries (`scoped_library_search.rs:452`, `engine.rs:11549`) did not move
-                //     at all, both re-read and sha256-confirmed in place.
+                //     at all, both re-read and sha256-confirmed in place. (`engine.rs`'s entry
+                //     has since moved to `:11619` — see the item-2 note on that entry below;
+                //     `scoped_library_search.rs:452` still has not moved.)
                 //
                 // ⚠ THIS ROW FAILS IN CI BEFORE IT FAILS LOCALLY, and that is not a bug in the
                 // row. CI checks out `refs/pull/<n>/merge` — this branch merged with CURRENT
@@ -15511,7 +15626,32 @@ mod stage2_injector_tests {
                 // `:11549`) to `a6d1a0e62:engine.rs:11549`, and it is still inside
                 // `begin_pending_trigger_target_selection`, which moved by the same +34
                 // (opens :11400 ⇒ :11434).
-                "game/engine.rs:11583".to_string(),
+                //
+                // ITEM 2 (`loop_period_controller`), REBASED ONTO `fa5fbdfd7`: `:11583 ⇒ :11696`.
+                // The three predecessor entries above were written against bases that are now
+                // history, and the rebase resolved a conflict in THIS array on every one of this
+                // branch's three commits — so the pin was NOT carried from either side of those
+                // conflicts. It was re-derived at the rebased tip, which is the only tree the
+                // assertion runs against.
+                //
+                // LOCATED BY CONTENT, NOT BY ARITHMETIC. Hashing every line in the file that
+                // opens this producer's prompt yields exactly ONE whose sha256 is
+                // `8a544e878d3e77fb` — `:11696`. (The producer's own text is deliberately NOT
+                // quoted in this comment: a prose copy of it would make the locating grep match
+                // twice, and a census that finds its instrument's own documentation is the
+                // stale-coordinate failure wearing a different hat.) A sum-of-hunks figure
+                // would have been the wrong instrument here regardless: three-way conflict
+                // resolution is not a line-shift, so `+113` is a description of where the
+                // producer landed, never the evidence that it is the same producer. Uniqueness of
+                // the hash IS that evidence, and it is what a stale-coordinate defect (the exact
+                // failure this census exists to catch) cannot survive.
+                //
+                // Still inside `begin_pending_trigger_target_selection` (opens `:11547`).
+                // SET PRESERVATION: `git diff --stat upstream/main...HEAD` on
+                // `effects/mod.rs` and `effects/scoped_library_search.rs` is EMPTY, so
+                // `:6175/:6252/:9456/:452` could not have moved and stand re-read in place.
+                // Total still **5**.
+                "game/engine.rs:11696".to_string(),
             ],
             "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
              plus the two repeated-optional-payment drivers, the per-player acceptance cursor \
@@ -16804,7 +16944,8 @@ mod kilo_interruptibility_tests {
 ///
 /// The reviewer measured all three by disabling them on the PRE-ROW tree: step (2)
 /// `ProposerIsNotActivePlayer` and step (5) `AdvantageOnlyCycle` could each be deleted with the
-/// whole suite still green, and only `DrivingSequenceNotEmpty` was asserted by name anywhere.
+/// whole suite still green, and only step (1b) (then `DrivingSequenceNotEmpty`, now
+/// `ProposerHasDrivingPeriod`) was asserted by name anywhere.
 /// A conjunct no row can name is a conjunct nobody notices losing.
 ///
 /// ⚠ The pass COUNT that used to appear here ("4167 passed / 0 failed") is deleted rather than
