@@ -9647,6 +9647,10 @@ pub enum WaitingFor {
         /// the player may discard 1 card matching this filter instead of `count`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unless_filter: Option<crate::types::ability::TargetFilter>,
+        /// CR 701.9a + CR 614.1: Optional operation-owned provenance for a
+        /// resolving discard (not discard costs or Ward).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
     },
     /// CR 608.2d: Player chooses object(s) from a zone during effect resolution.
     /// Generalizes the DiscardChoice pattern to sacrifice-from-battlefield and hand-to-battlefield.
@@ -14488,7 +14492,7 @@ declare_game_state! {
     /// time; an empty stack is omitted from raw live-state snapshots until the
     /// first migrated family parks work.
     #[serde(default, skip_serializing_if = "ResolutionStack::is_empty")]
-    pub resolution_stack: ResolutionStack,
+    pub resolution_stack: Box<ResolutionStack>,
 
     /// Borrowed execution-local view of the active continuation's captured
     /// Aura host. The authoritative value remains inside
@@ -14806,6 +14810,12 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub city_blessing: HashSet<PlayerId>,
+
+    /// CR 702.195a-b: Players with an enduring story designation. Once gained,
+    /// it persists for the rest of the game.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub enduring_story: Box<HashSet<PlayerId>>,
 
     /// CR 702.50a-b: Active Epic effects — one per resolved Epic spell. Each
     /// entry is a rest-of-game record: its controller can't cast spells
@@ -17902,7 +17912,7 @@ impl GameState {
         &mut self,
         command: &ResolvedFrameTransitionCommand,
     ) -> Result<(), ResolvedFrameTransitionReplayInvariantError> {
-        let mut resolution_stack = self.resolution_stack.clone();
+        let mut resolution_stack = (*self.resolution_stack).clone();
         match &command.transition {
             ResolvedFrameTransition::Push { frame } => resolution_stack.push_inner(frame.clone()),
             ResolvedFrameTransition::InsertParentOfActive { frame } => {
@@ -17916,7 +17926,7 @@ impl GameState {
             }
         }
         resolution_stack.validate(&self.waiting_for)?;
-        self.resolution_stack = resolution_stack;
+        *self.resolution_stack = resolution_stack;
         Ok(())
     }
 
@@ -18823,7 +18833,7 @@ impl GameState {
             modal_modes_chosen_this_game: HashSet::new(),
             revealed_cards: HashSet::new(),
             public_revealed_cards: HashSet::new(),
-            resolution_stack: ResolutionStack::default(),
+            resolution_stack: Box::default(),
             resolving_continuation_attach_host: None,
             merged_card_component_route: None,
             resolution_coin_flip: None,
@@ -18864,6 +18874,7 @@ impl GameState {
             exiled_from_hand_this_resolution: 0,
             monarch: None,
             city_blessing: HashSet::new(),
+            enduring_story: Box::default(),
             epic_effects: Vec::new(),
             restrictions: Vec::new(),
             pending_damage_replacements: Vec::new(),
@@ -20557,6 +20568,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         exiled_from_hand_this_resolution: _,
         monarch: _,
         city_blessing: _,
+        enduring_story: _,
         epic_effects: _,
         restrictions: _,
         pending_damage_replacements: _,
@@ -20856,6 +20868,7 @@ impl PartialEq for GameState {
             && self.lki_copiable_values == other.lki_copiable_values
             && self.lki_by_incarnation == other.lki_by_incarnation
             && self.city_blessing == other.city_blessing
+            && self.enduring_story == other.enduring_story
             && self.planar_deck == other.planar_deck
             && self.planar_controller == other.planar_controller
             && self.planar_die_actions_this_turn == other.planar_die_actions_this_turn
@@ -22314,7 +22327,7 @@ mod tests {
             .active_ability_continuation()
             .expect("fixture parks a trigger continuation")
             .clone();
-        state.resolution_stack = ResolutionStack::default();
+        state.resolution_stack = Box::default();
         let mut v1 = serde_json::to_value(state).expect("v1 fixture serializes");
         v1["resolution_state_version"] = serde_json::Value::from(1);
         v1["pending_continuation"] =
@@ -22483,7 +22496,7 @@ mod tests {
             .active_ability_continuation()
             .expect("fixture parks the trigger continuation")
             .clone();
-        state.resolution_stack = ResolutionStack::default();
+        state.resolution_stack = Box::default();
         let mut wire = serde_json::to_value(state).expect("v1 fixture serializes");
         wire["resolution_state_version"] = serde_json::Value::from(1);
         wire["pending_continuation"] =
@@ -25297,6 +25310,7 @@ mod tests {
             effect_kind: crate::types::ability::EffectKind::Discard,
             up_to: false,
             unless_filter: None,
+            discard_frame: None,
         }));
         variants.push(Box::new(WaitingFor::EffectZoneChoice {
             player: PlayerId(0),
