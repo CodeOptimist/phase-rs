@@ -15650,6 +15650,12 @@ mod stage2_injector_tests {
                 //     at all, both re-read and sha256-confirmed in place. (`engine.rs`'s entry
                 //     has since moved to `:11619` — see the item-2 note on that entry below;
                 //     `scoped_library_search.rs:452` still has not moved.)
+                //   Valakut #7047 fix round: `:9458 ⇒ :9442`, −16, and only that
+                //     effects/mod.rs entry moved relative to current main. The
+                //     `QuantityExpr::any_ref` relocation replaces the 16-line traversal match
+                //     with a delegation; it sits above this producer and below the first two.
+                //     The merge tree therefore retains main's first two coordinates
+                //     (`:6177`/`:6254`) and shifts this one by −16 to `:9442`.
                 //
                 // ⚠ THIS ROW FAILS IN CI BEFORE IT FAILS LOCALLY, and that is not a bug in the
                 // row. CI checks out `refs/pull/<n>/merge` — this branch merged with CURRENT
@@ -15664,7 +15670,7 @@ mod stage2_injector_tests {
                 // and is offered as a follow-up rather than taken unannounced mid-review.
                 "game/effects/mod.rs:6177".to_string(),
                 "game/effects/mod.rs:6254".to_string(),
-                "game/effects/mod.rs:9458".to_string(),
+                "game/effects/mod.rs:9442".to_string(),
                 // UNMOVED across the rebase, and that is itself evidence the SET did not
                 // move: a census that had gained or lost a producer would not leave this
                 // entry both byte-identical AND at the same coordinate.
