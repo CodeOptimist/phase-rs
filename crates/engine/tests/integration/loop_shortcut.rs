@@ -1,3 +1,4 @@
+// engine-citation-gate: symbol anchors only
 //! PR-7 Phase 3 — interactive loop-shortcut protocol + APNAP response window.
 //!
 //! Covers the CR 732.2a/b/c live-detect bridge, `LoopDetectionMode::Interactive`, the
@@ -20,6 +21,7 @@ use engine::analysis::decision_template::{
 };
 use engine::analysis::loop_check::{LoopCertificate, ShortcutProposal, ShortcutResponse, WinKind};
 use engine::analysis::resource::{loop_states_equal_modulo_resources, BoardDelta, ResourceAxis};
+use engine::game::derived_views::{FamilyCollapseState, UnboundedFamily};
 use engine::game::engine::{apply, EngineError};
 use engine::game::scenario::{GameRunner, GameScenario};
 use engine::types::ability::{Effect, TargetRef};
@@ -1023,7 +1025,7 @@ fn declare_and_respond_authorization() {
 
     // RIDER-2 — CR 732.2a decline authorization (fresh runner: the flow above consumed the
     // offer). `DeclineShortcut` is a normal protocol action dispatched via the
-    // `(waiting_for, action)` match; `check_actor_authorization` (engine.rs:225) runs BEFORE
+    // `(waiting_for, action)` match; `game/engine.rs`'s `check_actor_authorization` runs BEFORE
     // `apply_action` and keys on `WaitingFor::LoopShortcut.acting_player` == the proposer.
     // Unlike `Concede`/`Debug`, `DeclineShortcut` is NOT on any pre-match early-return
     // allowlist, so a wrong actor is rejected with the SPECIFIC `WrongPlayer` — proving the
@@ -2388,8 +2390,9 @@ const POISON_RIDER: &str = "Whenever you gain life, each opponent gets a poison 
 ///
 /// MEASURED reachability (this 2-trigger fixture does NOT reach the Path-B bridge): the two
 /// simultaneous triggers per lifegain event open OrderTriggers beats, and every non-
-/// `Priority{active_player}` beat CLEARS `loop_detect_ring` (engine.rs:1307). So the ring
-/// never accumulates, the `!ring.is_empty()` bridge gate (engine.rs:338) never passes, and
+/// `Priority{active_player}` beat CLEARS `loop_detect_ring` (`game/engine.rs`'s
+/// `pass_priority_once_with_pipeline` sample-or-clear arm). So the ring never accumulates, the
+/// `!ring.is_empty()` bridge gate in `reconcile_terminal_result` never passes, and
 /// `interactive_loop_bridge` is never entered (measured: 0 bridge invocations). The loop
 /// instead resolves via the CR 704.5c 10-poison SBA to GameOver{Some(P0)} (both opponents
 /// reach 10 poison and are eliminated). It therefore does NOT exercise the Path-B
@@ -2412,17 +2415,20 @@ fn setup_3p_poison_draw(mode: LoopDetectionMode) -> (GameRunner, ObjectId) {
 
 /// Path-B DRAW-GATE behavioral test (two halves):
 ///   - CONTROL (`setup_3p_draw`, pure lifegain, no poison) is a POSITIVE test that the Path-B
-///     draw gate CERTIFIES a benign no-loss loop: it draws `GameOver{None}` via engine.rs:517
-///     (measured P0 life 22, cycle ~2; and neutering :517 makes this control STOP drawing —
-///     confirmed the draw originates AT that gate, not the strict :1507 detector).
+///     draw gate CERTIFIES a benign no-loss loop: it draws `GameOver{None}` via
+///     `interactive_loop_bridge`'s `has_no_loss_axis` draw arm — the one that pushes
+///     `GameEvent::GameOver { winner: None }` (measured P0 life 22, cycle ~2; and neutering that
+///     arm makes this control STOP drawing — confirmed the draw originates AT that gate, not at
+///     the stricter arm of the same fn, which additionally requires
+///     `classify_win_kind(..) == WinKind::Advantage` and emits no `GameOver` at all).
 ///   - VARIANT (`setup_3p_poison_draw`, IDENTICAL + a poison-rider creature) locks that a
 ///     poison-accruing loop is NOT wrongly drawn: it resolves via the CR 704.5c 10-poison SBA
 ///     to `GameOver{Some(P0)}` (measured P0 life 30, poisons [0,10,10], both opponents
 ///     eliminated).
 ///
 /// SCOPE (measured — do NOT overclaim): this does NOT isolate `has_no_loss_axis`'s Path-B
-/// conjunct. That conjunct IS load-bearing BY CONSTRUCTION (it is the SOLE loss-axis veto at
-/// :512-516, which has NO `== Advantage` backstop — a poison loop that reached the gate would
+/// conjunct. That conjunct IS load-bearing BY CONSTRUCTION (it is the SOLE loss-axis veto in that
+/// draw arm, which has NO `== Advantage` backstop — a poison loop that reached the gate would
 /// be wrongly drawn without it), but it is currently NOT runtime-discriminable, so there is NO
 /// claim here that deleting it flips the variant. MEASURED: deleting `has_no_loss_axis` from
 /// Path B leaves the variant terminal `GameOver{Some(P0)}` UNCHANGED — because the variant
@@ -2431,7 +2437,8 @@ fn setup_3p_poison_draw(mode: LoopDetectionMode) -> (GameRunner, ObjectId) {
 /// drop removes the poison conjunct (card-build keeps only `GainLife`), so poison is 0 in the
 /// loop delta at the gate → it draws as a benign lifegain loop and never exercises
 /// has_no_loss_axis's poison veto. No constructible fixture carries poison>0 to the Path-B gate
-/// (the 2-trigger form clears `loop_detect_ring` on its OrderTriggers beats at engine.rs:1307;
+/// (the 2-trigger form clears `loop_detect_ring` on its OrderTriggers beats, in
+/// `pass_priority_once_with_pipeline`'s sample-or-clear arm;
 /// the single-compound-trigger form drops the poison at parse). So the Path-B veto is proven
 /// load-bearing IN CODE and its runtime discriminator is WAIVED pending the poison-drop parser
 /// fix.
@@ -2547,7 +2554,8 @@ fn setup_2p_optional_drain_poison(mode: LoopDetectionMode) -> (GameRunner, Objec
 ///   • the `"you gain N life and each opponent gets a poison counter"` compound DROPS the poison
 ///     conjunct at parse (keeps only `GainLife`), so poison never reaches the delta.
 /// Both are pre-existing sampler/parser limitations, independent of this change (see
-/// `interactive_recurring_poison_is_not_drawn` above, loop_shortcut.rs:1191-1239). The novel
+/// `interactive_recurring_poison_is_not_drawn` above — by symbol; the line range that used to
+/// follow it pointed at unrelated code even before this change moved it). The novel
 /// per-victim classify/faller logic is proven by the `loop_check.rs` unit tests
 /// (`live_winner_names_poison_faller`, `detects_poison_loop_as_poison_loss`, the refuse cases);
 /// this test adds the missing END-TO-END proof that the re-keyed axis reaches a live cert.
@@ -4351,7 +4359,7 @@ fn loop_shortcut_serializes_schema_under_data() {
 }
 
 /// T-concede-winner — the `predicted_winner` conjunct of the `apply_confirmed_shortcut` liveness
-/// guard (`engine.rs:864-878`). The latched PREDICTED WINNER (not the proposer) concedes DURING the
+/// guard (in `game/engine.rs`). The latched PREDICTED WINNER (not the proposer) concedes DURING the
 /// open CR 732.2b APNAP window. `GameAction::Concede` bypasses the `WaitingFor` dispatch, so the
 /// offer survives with a departed winner latched in `proposal.predicted_winner`. On the last living
 /// opponent's Accept, the guard must REFUSE to act on the stale proposal (CR 104.3a: the winner has
@@ -5137,7 +5145,7 @@ fn foreign_mana_ability_still_vetoes() {
 ///
 /// This is also the closure for the §I `ActivationRestriction` composition hazard at
 /// the offer level: the firewall never reads `activation_restrictions`
-/// (`ability_scan.rs:4238` destructures it as `_`), so a row keyed on that field would
+/// (`game/ability_scan.rs`'s `ability_definition_axes` destructures it as `_`), so a row keyed on that field would
 /// be dominated. This row instead asserts the property the revert-probes actually flip.
 ///
 /// REVERT-PROBE: widen X1's relief from the per-ability test to the whole object (skip
@@ -5806,7 +5814,8 @@ fn two_site_retention_survives_a_prompt_and_its_answer() {
 
     let pin = engine_live_opponents(&state, P0).first().copied();
 
-    // (i) the `:3457` sampler half: a forced pre-priority window observed with an
+    // (i) the `pass_priority_once_with_pipeline` sampler half (its `is_forced_cascade_window`
+    //     clear arm): a forced pre-priority window observed with an
     //     ALREADY-ACCUMULATED ring (>= 2 frames, so a single fresh sample cannot explain it).
     let mut prompt_ring: Option<usize> = None;
     // (ii) the `apply_action` half: the ring across the ANSWER to such a window, with the
@@ -7199,8 +7208,8 @@ fn phase_reachable_ledger_observer_whose_filter_matches_the_class_still_suppress
 
 // ===========================================================================
 // R6a — the ∞ badge stays up while a collapse is merely SCHEDULED (the engine defers APPLYING
-// an accepted shortcut's growth to the CR 500.5 boundary; that window is an engine deviation, not
-// a rules entitlement), and CR 732.2c bounds the boundary prompt by the count the table accepted.
+// an accepted shortcut's growth to the CR 500.5 boundary, while advancing to the proposal's
+// ending point per CR 732.2c), and CR 732.2c bounds the boundary prompt by the accepted count.
 // ===========================================================================
 
 /// Sprout Swarm in P0's hand in the `witherbloom_sprout_lumaret_simple_4p` capture.
@@ -7269,9 +7278,9 @@ fn r6a_drive_to_boundary(state: &mut GameState) {
 /// `unbounded_resources = {P0: [Life(0), TokensCreated]}` plus a non-empty ∞ pile, and
 /// registers a finite collapse. The COUNT is fixed at accept (`pending_materialization_count`,
 /// which bounds the boundary prompt per CR 732.2c); what this engine defers is APPLYING it, until
-/// the CR 500.5 boundary (`game::turns`). That deferral is an engine deviation — pre-existing,
-/// deliberate, and licensed by no CR. This test pins what the engine DOES during that window, not
-/// a claim that the rules put the game there: the marks and their enablers are still live, so the
+/// the CR 500.5 boundary (`game::turns`), while the game advances to the proposal's ending point
+/// (CR 732.2c; `types::game_state`'s `scheduled_collapse_axes` doc has the full reading). This test
+/// pins what the engine DOES during that window: the marks and their enablers are still live, so the
 /// projection KEEPS every `∞` surface. CR 732.2c bounds the collapse; it never licensed hiding a
 /// mark the store still carries, which is what the BASE gate used it for.
 ///
@@ -7436,6 +7445,47 @@ fn scheduled_collapse_still_renders_the_unbounded_badge() {
             "the viewer-FILTERED broadcast path must project the FULL ∞ pile membership \
              (viewer {viewer:?})"
         );
+
+        // NOTE ON WHAT COVERS "flagging must not FILTER rows": the `got_axes == expected_axes`
+        // assertion above is exact-set equality against every marked axis, so it already fails if
+        // the scheduled flag ever suppressed a row. A separate "a TokensCreated row exists" pin
+        // used to sit here and was strictly subsumed by it — no mutation could red the pin without
+        // first reding the equality — so it is gone rather than left as decoration. (Rows CAN be
+        // dropped, by `object_growth_backing`, for a TOKEN axis whose whole registered pile left
+        // the battlefield; this fixture keeps its backing intact, pinned by `expected_pile`.)
+        //
+        // R2 — the SCHEDULE survives the viewer-filtered broadcast path. Read off
+        // `unbounded_families`, the channel that replaced the per-row `scheduled` flag; the
+        // certainty CLASS is pinned elsewhere (B-1, W2, M2-a/M2-c), what matters here is that a
+        // scheduled family reaches every viewer.
+        let scheduled_families: Vec<UnboundedFamily> = views
+            .unbounded_families
+            .iter()
+            .filter(|f| matches!(f.state, FamilyCollapseState::Scheduled(_)))
+            .map(|f| f.family)
+            .collect();
+        assert!(
+            scheduled_families.contains(&UnboundedFamily::Life)
+                && scheduled_families.contains(&UnboundedFamily::Tokens),
+            "R2/filtered: the filtered broadcast path reports both scheduled families (viewer \
+             {viewer:?}), got {:?}",
+            views.unbounded_families
+        );
+        // R1 — the channel survives serialize→deserialize, and a POPULATED channel is EMITTED.
+        // `unbounded_families` is `skip_serializing_if = "Vec::is_empty"`, so the emission half is
+        // what catches a state that is computed correctly and then silently dropped on the wire.
+        let json = serde_json::to_string(&views).expect("serialize");
+        let back: engine::game::derived_views::DerivedViews =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.unbounded_families, views.unbounded_families,
+            "R1/roundtrip: the family collapse states survive serialize→deserialize (viewer \
+             {viewer:?})"
+        );
+        assert!(
+            json.contains("\"unbounded_families\"") && json.contains("\"Scheduled\""),
+            "R1/emitted: a populated family channel is EMITTED, not skipped (viewer {viewer:?})"
+        );
     }
 
     // (4) THE STORE IS UNTOUCHED — the projection read, it did not mutate.
@@ -7587,9 +7637,9 @@ fn stale_pile_member_is_omitted_from_the_wire_but_kept_in_the_store() {
 ///
 /// REVERT-PROBE (RP-4, RUN): hide rows matching
 /// `matches!(axis, ResourceAxis::TokensCreated | ResourceAxis::Counter(..) | ResourceAxis::Life(_))`
-/// — a *transcription* of `LoopCollapseAxis::from_resource_axis`'s three `Some` arms
-/// (`types/game_state.rs:11133/11136/11137`), inlined because that fn is a bare module-private
-/// `fn` (`:11131`) and `game::derived_views` is a sibling module, so calling it is
+/// — a *transcription* of the three `Some` arms of `LoopCollapseAxis::from_resource_axis`
+/// (`types/game_state.rs`), inlined because that fn is declared as a bare module-private
+/// `fn` and `game::derived_views` is a sibling module, so calling it is
 /// `error[E0624]: associated function from_resource_axis is private`. Do not widen its
 /// visibility. ⇒ BOTH arms FAIL, and arm 2 is the one that is unreachable by any stash-keyed
 /// probe, because the stash is already gone when it runs.
@@ -7629,9 +7679,57 @@ fn unregistered_axis_still_renders_its_infinity_badge() {
         "a merely-SCHEDULED collapse still projects both ∞ rows, got {scheduled_axes:?}"
     );
 
+    // R3 PRE-CLEAR positive control — without it the post-clear "every family Unscheduled" below
+    // is VACUOUS: a mutant that never reports a schedule at all satisfies the post-clear
+    // assertion, so the pair only discriminates because this arm proves a schedule CAN be reported
+    // on this same state.
+    {
+        let v = engine::game::derived_views::derive_views(&state, None);
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(
+            v.unbounded_families
+                .iter()
+                .any(|f| matches!(f.state, FamilyCollapseState::Scheduled(_)))
+                && j.contains("\"Scheduled\""),
+            "R3/pre-clear: a registered materialization SCHEDULES a family AND emits it, got {:?}",
+            v.unbounded_families
+        );
+    }
+
     // ARM 2: drop the registrations, keep the marks — an ∞ axis that is collapsible-LABELLED but
     // has nothing scheduled to collapse it.
     state.pending_unbounded_materialization.clear();
+
+    // R3 — with nothing scheduled EVERY family is `Unscheduled`, which is deliberately NOT the
+    // same as "the channel disappears": the ∞ badges are still on screen, they just promise
+    // nothing. The rows must therefore still be there, and the `Scheduled` encoding must be gone
+    // from the wire entirely.
+    {
+        let v = engine::game::derived_views::derive_views(&state, None);
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(
+            !v.unbounded_families.is_empty()
+                && v.unbounded_families
+                    .iter()
+                    .all(|f| f.state == FamilyCollapseState::Unscheduled),
+            "R3/post-clear: with nothing scheduled every family is Unscheduled — and the channel \
+             is still populated, so this is not vacuous; got {:?}",
+            v.unbounded_families
+        );
+        assert!(
+            !j.contains("\"Scheduled\""),
+            "R3/post-clear: no Scheduled state reaches the wire, got {j}"
+        );
+        let back: engine::game::derived_views::DerivedViews = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            back.unbounded_families, v.unbounded_families,
+            "R3/default: the Unscheduled channel round-trips unchanged"
+        );
+        assert!(
+            !back.unbounded_resources.is_empty(),
+            "R3/default reach: …and it still carries the rows, so the line above is not vacuous"
+        );
+    }
 
     let rows = engine::game::derived_views::derive_views(&state, None).unbounded_resources;
     let axes: Vec<ResourceAxis> = rows.iter().map(|r| r.axis).collect();

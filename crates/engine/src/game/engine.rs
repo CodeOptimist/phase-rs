@@ -1606,15 +1606,18 @@ fn interactive_loop_bridge(state: &mut GameState, result: &mut ActionResult) {
             //     arm is never even reached.
             //   - life↓ (self-burn): life is a Consumed axis (`ResourceVector::components`),
             //     so `is_net_progress` (conjunct 2) returns false on any net-negative life
-            //     (resource.rs ~:409, over all players) before conjunct 3 runs.
+            //     (`ResourceVector::is_net_progress`'s `Component::Consumed if value < 0`
+            //     arm, over all players) before conjunct 3 runs.
             //   - poison↑ (self-poison): `classify_win_kind` (conjunct 4) maps poison>0 to
             //     `WinKind::PoisonLoss`, not `Advantage`, so the `== Advantage` conjunct
             //     rejects it.
-            // CONTRAST — the Path-B DRAW gate (:512-516 = recurrence + is_net_progress +
-            // has_no_loss_axis, with NO `== Advantage` backstop) is DIFFERENT: there
+            // CONTRAST — the Path-B DRAW gate (the EARLIER draw arm in this same
+            // `interactive_loop_bridge`: recurrence + is_net_progress + has_no_loss_axis, and it is
+            // the arm carrying NO `classify_win_kind` / `== Advantage` conjunct) is DIFFERENT: there
             // `has_no_loss_axis` is the SOLE loss-axis veto and is LOAD-BEARING BY
             // CONSTRUCTION — it MUST NOT be removed. A poison loop reaching Path B satisfies
-            // recurrence (poison is projected out at resource.rs:1995) AND is_net_progress
+            // recurrence (poison is projected out by `projected_player_axes`, which destructures
+            // `poison_counters` out of the compared image) AND is_net_progress
             // (poison is a Gained axis, which cannot make is_net_progress false), so without
             // this conjunct such a loop would be WRONGLY certified a CR 732.4 draw. (Path C's
             // poison redundancy comes ENTIRELY from its extra `== Advantage` conjunct, which
@@ -1625,7 +1628,8 @@ fn interactive_loop_bridge(state: &mut GameState, result: &mut ActionResult) {
             // delta at the gate → it draws as a benign lifegain loop and never exercises
             // has_no_loss_axis's poison veto. No constructible fixture carries poison>0 to the
             // Path-B gate (the 2-trigger form clears `loop_detect_ring` on its OrderTriggers
-            // beats at engine.rs:1307; the single-compound-trigger form drops the poison at
+            // beats, in `apply_action`'s `PassPriority | OrderTriggers { .. }` ring-clear arm;
+            // the single-compound-trigger form drops the poison at
             // parse). The runtime discriminator is therefore WAIVED as measured-unsatisfiable;
             // this in-code load-bearing-by-construction proof is the substitute. See the
             // `interactive_recurring_poison_is_not_drawn` Path-B behavioral test.
@@ -4661,6 +4665,42 @@ fn current_period_life_growth(state: &GameState) -> Vec<(PlayerId, u32)> {
 /// never auto-resolve, CR 732.2a). Both driven iterations run inside ONE
 /// `SimulationProbeGuard` so the injector's internal `apply_action` never recurses into
 /// this hook or any `!in_simulation_probe()`-gated shortcut logic.
+///
+/// # CR 732.1b — THIS ENGINE REPRESENTS THE LOOP INSTEAD OF PERFORMING IT
+///
+/// CR 732.1b: once the game reaches a state "in which a set of actions could be repeated
+/// indefinitely", the shortcut rules "can be used to determine how many times those actions are
+/// repeated without having to actually perform them, and how the loop is broken". Both halves of
+/// that sentence name an instrument this engine builds, and they are the two surfaces to map:
+///   • *how many times* — the `∞` capability marker and the certificate's bound. The loop is
+///     represented, never driven to exhaustion; `analysis::resource::elimination_bounds` supplies
+///     the largest count a proposal may legally contain.
+///   • *how the loop is broken* — the accept-or-shorten window (`WaitingFor::RespondToShortcut`)
+///     and the finite collapse the controller names at the ending point
+///     (`PayableResource::LoopCollapse`).
+///
+/// Representing rather than performing is the rule's own remedy, not an engine convenience.
+///
+/// CR 732.1a: "The rules for taking shortcuts are largely informal. As long as each player in the
+/// game understands the intent of each other player, any shortcut system they use is acceptable."
+/// A digital system that publishes the proposal, collects each other player's accept-or-shorten
+/// answer in turn order, and advances to the proposed ending point is such a system.
+///
+/// # WHERE THE SHORTCUT ENDS — THE SHORT VERSION
+///
+/// The loop ends by proceeding directly to the phase change, with the iterations elided by
+/// CR 732.1b ("without having to actually perform them"). At the phase change the opposing player
+/// has priority, and that priority window is the proposal's ending point. That is all this engine
+/// does, and CR 732.2a asks nothing more of it.
+///
+/// The support, for anyone checking the clause: CR 732.2a requires "the ending point of this
+/// sequence must be a place where a player has priority", which is satisfied by that window and
+/// NOT by the CR 500.5 step/phase end itself — CR 500.5 is a turn-based action and CR 117.3a puts
+/// priority at the BEGINNING of the next step. CR 732.2c then holds on its own terms: the game
+/// "advances to the last proposed ending point, with all game choices contained in the shortcut
+/// proposal having been taken", and the growth this engine lands at the CR 500.5 boundary is
+/// landed while that advance is still in progress. Stated again at `PayableResource::LoopCollapse`,
+/// which is where the count is named.
 fn try_offer_object_growth_shortcut(
     state: &GameState,
 ) -> Option<(
@@ -4703,7 +4743,35 @@ fn try_offer_object_growth_shortcut(
         .map(|c| loop_action_expected_def(state, c))
         .collect();
     // CR 732.2a: a shortcut "can't include conditional actions, where the outcome of a game
-    // event determines the next action." A driving ability whose body bears an auto-resolved
+    // event determines the next action."
+    //
+    // THIS GATE IS WHY EVERY PROPOSAL THIS ENGINE MAKES IS LEGAL — unconditionality holds BY
+    // CONSTRUCTION, not by inspection after the fact. Nothing conditional can reach a proposal:
+    // randomness is rejected here before driving, and `analysis::resource::elimination_bounds`
+    // separately stops the count STRICTLY SHORT of every CR 704 loss threshold, because a
+    // mid-sequence death would make the remaining declared choices unmakeable — itself a
+    // conditional action and an illegal proposal. Consequence for the display layer: a family the
+    // engine cannot certify as an unconditional collapse is never proposed as one, so
+    // `FamilyCollapseState::{Unscheduled, Mixed}` render the ABSENCE of a proposal this gate would
+    // pass — never a conditional proposal, which this gate does not emit. `Scheduled(Conditional)`
+    // is a DIFFERENT claim: that proposal PASSED this gate, and only its boundary materialization
+    // can still decline or park (see `CollapseCertainty` and
+    // `engine_resolution_choices::materialization_certainty`). Certainty is a property of the
+    // boundary, not of the proposal's unconditionality — `FamilyCollapseState` has no `Committed`
+    // variant of its own; `Committed` belongs to `CollapseCertainty`.
+    //
+    // THAT DISTINCTION STRENGTHENS L2, IT DOES NOT QUALIFY IT. A proposal that passes here and can
+    // still be declined at its boundary is routes (b)/(c) of the fidelity invariant WORKING, not a
+    // conditional action leaking past this gate. CR 732.2a's clause governs whether the SEQUENCE's
+    // next action is determined by the outcome of a game event — and none of it is, because the
+    // pins fixed every free choice BEFORE the offer existed. What a boundary may still do is
+    // decline the ELISION and hand those same iterations back to manual play, which is exactly how
+    // ELISION ≡ PERFORMANCE is preserved once an observer appears mid-window. Declining an elision
+    // can never be rules-incorrect: the elision is what needs a license, its absence never does.
+    // The invariant in full, with all three materialization routes, is at `types::game_state`'s
+    // `scheduled_collapse_axes` doc.
+    //
+    // A driving ability whose body bears an auto-resolved
     // coin flip (CR 705.1) / die roll (CR 706.1a) / random selection (CR 701.9a/b) has more
     // than one equally-likely outcome ⇒ not a legal shortcut. Reject it STATICALLY, before
     // driving (cheap + compile-time exhaustive over `Effect`), scanning EVERY step of the period
@@ -5443,8 +5511,11 @@ fn handle_respond_to_shortcut(
             }
         }
         crate::analysis::loop_check::ShortcutResponse::Shorten { .. } => {
-            // CR 732.2c (Phase-3 conservative): hand this opponent a real priority window
-            // instead of taking the shortcut. Finite-K materialization is Phase 4.
+            // DEFICIENCY NOTE (realization gap vs the design at `types::game_state`'s
+            // `scheduled_collapse_axes` doc; full note on `ShortcutResponse`): CR 732.2b makes the
+            // named place the new ending point, so the shortcut should still be taken up to there.
+            // This hands the responder a real priority window instead. Tracked by the
+            // "Shortcut-system rules-correctness completion" follow-up in `.deferred-backlog.md`.
             priority::reset_priority(state);
             state.priority_player = player;
             state.waiting_for = WaitingFor::Priority { player };
@@ -15688,7 +15759,47 @@ mod stage2_injector_tests {
                 // the two tests this change adds contain no line matching the needle, so the
                 // total stays 37 and the partition stays 5/7/25. A drop path releasing a
                 // construction cursor cannot mint a CR 603.5 prompt.
-                "game/engine.rs:11712".to_string(),
+                //
+                // CR 732 ANNOTATION ROUND (this branch, base `684335b0a`): `:11712 ⇒ :11763`,
+                // `+51`, and ONLY this entry moved — the other four live in `effects/` and
+                // `scoped_library_search.rs`, untouched by a comment-only change. The `+51` is
+                // exactly this file's three hunks, ALL of which land above the producer:
+                // `@@ -4663,0 +4664,36 @@` (the CR 732.1b / 732.1a / 732.2a block on
+                // `try_offer_object_growth_shortcut`) is `+36`, `@@ -4706 +4742,13 @@` (the
+                // no-conditional-actions clause's role) is `+12`, and `@@ -5446,2 +5494,5 @@`
+                // (the `Shorten` deficiency note) is `+3`; predicted `11712+51` equals the
+                // observed coordinate exactly. Identity re-established, not assumed, on three
+                // axes: the line at `:11763` is sha256-identical to
+                // `684335b0a:game/engine.rs:11712`
+                // (`8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`); that
+                // text occurs exactly ONCE in the file, so the coordinate is unambiguous; and
+                // it is still inside `begin_pending_trigger_target_selection` on both sides.
+                // (That enclosing-function name is a CORRECTION: this row previously said
+                // `apply_retarget`, which is the function ABOVE it — `apply_retarget` ends where
+                // `begin_pending_trigger_target_selection` begins, and the producer sits inside
+                // the latter, as this assertion's own message has always said. The coordinate,
+                // the `+51`, and the digest were unaffected; only the named function was wrong.)
+                // The round is comment-only, so no `waiting_for = ` or `Ok(Some(` line was added
+                // or removed anywhere and the total stays 37 with the partition 5/7/25.
+                //
+                // CR 732 FIX ROUND (same branch, review response): `:11763 ⇒ :11783`, `+20`, and
+                // again ONLY this entry moved — the other four live in `effects/` and
+                // `scoped_library_search.rs`, which this comment-only round does not touch. The
+                // `+20` decomposes over exactly five hunks, ALL above the producer: four
+                // one-line growths in `interactive_loop_bridge` converting the redundancy
+                // proof's four wrong line citations to symbol anchors (`+1` each), plus
+                // `@@ -4750,3 +4754,19 @@` in `try_offer_object_growth_shortcut` (`+16`) for the
+                // `FamilyCollapseState` correction and the lemma closure that follows it.
+                // Predicted `11763+20` equals the observed coordinate exactly. Identity
+                // re-established, not assumed: the line at `:11783` is sha256-identical to
+                // `684335b0a:game/engine.rs:11712` and to `2b20aa73a:game/engine.rs:11763`
+                // (`8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`); the text
+                // occurs exactly ONCE in the file; and it is still inside
+                // `begin_pending_trigger_target_selection`. Worth recording WHY this drift was
+                // caught late: the round that introduced it shipped while GitHub Actions was in
+                // a major outage, so CI could not answer, and a comment-only diff reads as
+                // incapable of moving a line pin right up until it does.
+                "game/engine.rs:11783".to_string(),
             ],
             "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
              plus the two repeated-optional-payment drivers, the per-player acceptance cursor \
