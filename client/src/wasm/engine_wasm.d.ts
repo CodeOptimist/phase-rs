@@ -122,6 +122,20 @@ export function get_ai_action_proposal(difficulty: string, player_id: number): a
 export function get_ai_action_proposal_from_scores(scores_json: string, difficulty: string, player_id: number, rng_seed: bigint): any;
 
 /**
+ * Diagnostic counterpart of score-worker proposal rebinding. It preserves the
+ * existing authority filter and selector; the returned receipt is local WASM
+ * observability data bound to the same opaque token.
+ */
+export function get_ai_action_proposal_from_scores_with_diagnostics(scores_json: string, difficulty: string, player_id: number, rng_seed: bigint): any;
+
+/**
+ * Mint an ordinary opaque proposal together with a local-only diagnostic
+ * receipt. The receipt is an observation of the minted capability, never an
+ * additional action-selection API.
+ */
+export function get_ai_action_proposal_with_diagnostics(difficulty: string, player_id: number): any;
+
+/**
  * Score candidates inside an isolated AI worker. These are plain,
  * serializable hints rather than capabilities: they cannot cross the action
  * boundary until the live main engine reissues an exact proposal.
@@ -486,6 +500,8 @@ export interface InitOutput {
     readonly getFormatRegistry: () => any;
     readonly get_ai_action_proposal: (a: number, b: number, c: number) => [number, number, number];
     readonly get_ai_action_proposal_from_scores: (a: number, b: number, c: number, d: number, e: number, f: bigint) => [number, number, number];
+    readonly get_ai_action_proposal_from_scores_with_diagnostics: (a: number, b: number, c: number, d: number, e: number, f: bigint) => [number, number, number];
+    readonly get_ai_action_proposal_with_diagnostics: (a: number, b: number, c: number) => [number, number, number];
     readonly get_ai_scored_candidates: (a: number, b: number, c: number, d: bigint) => [number, number, number];
     readonly get_card_face_data: (a: number, b: number) => any;
     readonly get_card_parse_details: (a: number, b: number) => any;
