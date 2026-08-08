@@ -4,7 +4,10 @@ use crate::game::turn_control;
 use crate::types::actions::GameAction;
 use crate::types::player::PlayerId;
 
-use super::candidates::{candidate_actions_for_semantic_owner_with_probe, CandidateAction};
+use super::{
+    candidates::{candidate_actions_for_semantic_owner_with_probe, CandidateAction},
+    FilterPipeline,
+};
 
 #[derive(Debug, Clone)]
 pub struct AiDecisionContext {
@@ -35,15 +38,17 @@ impl AiDecisionContract {
             authorized_actor: turn_control::authorized_submitter_for_player(state, semantic_owner),
             state_revision: state.state_revision,
             // The engine's candidate enumerator is the authoritative finite
-            // domain for this prompt. Some bounded continuation forms (combat,
-            // search, and multi-step selections) are intentionally completed
-            // by their dedicated reducer paths, so a generic clone-and-apply
-            // probe is not a sound way to remove them from the contract.
-            // Submission still performs the public action-boundary apply after
-            // exact-membership and owner checks.
+            // domain for this prompt. Combat and search continuations remain
+            // reducer-owned. A target choice crosses the reducer only when the
+            // pending spell's mana obligation can still change with its final
+            // target set. Submission still performs the public action-boundary
+            // apply after exact-membership and owner checks.
             candidates: {
                 let mut candidates =
                     candidate_actions_for_semantic_owner_with_probe(state, semantic_owner, None);
+                if target_selection_requires_reducer_validation(state) {
+                    candidates = FilterPipeline::default_pipeline().apply(state, candidates);
+                }
                 candidates.sort_by(|left, right| left.action.cmp_stable(&right.action));
                 candidates
             },
@@ -95,6 +100,29 @@ impl AiDecisionContract {
                 .any(|candidate| candidate_action_matches(&candidate.action, action)),
         }
     }
+}
+
+pub(crate) fn target_selection_requires_reducer_validation(state: &GameState) -> bool {
+    let WaitingFor::TargetSelection {
+        player,
+        pending_cast,
+        target_slots,
+        selection,
+        ..
+    } = &state.waiting_for
+    else {
+        return false;
+    };
+
+    // Only the final target can lock a target-dependent cost. Earlier
+    // selections are valid reducer continuations regardless of whether the
+    // eventual cost is payable.
+    selection.current_slot.checked_add(1) == Some(target_slots.len())
+        && !crate::game::casting::pending_mana_obligation_is_stable_before_targets(
+            state,
+            *player,
+            pending_cast,
+        )
 }
 
 fn candidate_action_matches(issued: &GameAction, submitted: &GameAction) -> bool {

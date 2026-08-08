@@ -14624,13 +14624,16 @@ pub(super) fn spell_tap_payment_mode_for(
 /// CR 601.2c + CR 601.2f: Target selection may precede locking the final
 /// mana obligation. Return true only when none of the production cost axes can
 /// still change the amount or the sources available before payment.
-pub(super) fn pending_mana_obligation_is_stable_before_targets(
+pub(crate) fn pending_mana_obligation_is_stable_before_targets(
     state: &GameState,
     player: PlayerId,
     pending: &PendingCast,
 ) -> bool {
-    if pending.activation_ability_index.is_some()
-        || casting_costs::cost_has_x(&pending.cost)
+    if pending.activation_ability_index.is_some() {
+        return true;
+    }
+
+    if casting_costs::cost_has_x(&pending.cost)
         || pending.additional_cost_flow.is_some()
         || pending.deferred_required_additional_cost.is_some()
         || !pending.additional_cost_queue.is_empty()
@@ -14689,6 +14692,17 @@ pub(super) fn pending_mana_obligation_is_stable_before_targets(
         })
     {
         return false;
+    }
+
+    // `static_mode_presence` is a post-flush superset of the two static
+    // families that can affect a spell's cost. Its absence proves the exact
+    // scan below cannot find a target-dependent axis, avoiding an O(board)
+    // scan at every ordinary target-selection prompt.
+    if !state.layers_dirty.is_dirty()
+        && !static_kind_present(state, StaticModeKind::ModifyCost)
+        && !static_kind_present(state, StaticModeKind::ImposeAdditionalCost)
+    {
+        return true;
     }
 
     !super::functioning_abilities::game_functioning_statics(state).any(|(source, definition)| {
