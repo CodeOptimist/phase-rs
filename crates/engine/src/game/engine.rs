@@ -5567,6 +5567,15 @@ fn remember_public_reveals(state: &mut GameState, events: &[GameEvent], journal_
                     ResolvedInformationEdit::Reveal,
                 )
                 .expect("published reveal occurrences must be live and distinct");
+            // A public reveal is durable product knowledge for every player.
+            // Keep this centralized at the event boundary so individual effect
+            // resolvers cannot publish duplicate or divergent facts.
+            let audience = state
+                .players
+                .iter()
+                .map(|player| player.id)
+                .collect::<Vec<_>>();
+            state.remember_card_identities(audience, &unpublished);
         }
     }
 }
@@ -6775,6 +6784,21 @@ fn apply_action(
     ) {
         state.private_look_ids.clear();
         state.private_look_player = None;
+    }
+
+    // A ScryChoice has already disclosed its cards to the deciding player. The
+    // choice response is the first reducer boundary at which that private view
+    // can become durable product knowledge; this never changes the prompt or
+    // rules-visible Scry state.
+    if matches!(&action, GameAction::SelectCards { .. }) {
+        if let WaitingFor::ScryChoice { player, cards } = &state.waiting_for {
+            let player = *player;
+            let cards = cards.clone();
+            state.remember_card_identities(
+                turn_control::decision_audience_for_player(state, player),
+                &cards,
+            );
+        }
     }
 
     let mut events = Vec::new();
@@ -15897,8 +15921,9 @@ mod stage2_injector_tests {
                 // `WaitingForWithParkedObservers` match arm is the only hunk above this
                 // producer; it changes trigger-drain timing but does not add a prompt.
                 // The Ward continuation port independently inserts +13 lines above the same
-                // producer, so the combined tree is `:11828 - 7 + 13 = :11834`.
-                "game/engine.rs:11834".to_string(),
+                // producer, while this branch's durable-knowledge hooks add another 24, so the
+                // combined tree is `:11828 - 7 + 13 + 24 = :11858`.
+                "game/engine.rs:11858".to_string(),
             ],
             "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
              plus the two repeated-optional-payment drivers, the per-player acceptance cursor \

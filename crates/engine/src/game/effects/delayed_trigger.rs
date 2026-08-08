@@ -204,21 +204,15 @@ pub fn resolve(
     //
     // CR 603.7c: See separate branch for LastCreated snapshots.
     //
-    // CR 603.7b: A MULTI-FIRE WheneverEvent must NOT snapshot TriggeringSource at
-    // creation — each firing has its own triggering source (Love on the
-    // Battlefield: "put a +1/+1 counter on it" resolves `it` = the creature that
-    // dealt combat damage THIS firing, re-resolved from the per-firing damage
-    // event). Snapshotting here would freeze it to the creation event
-    // (AttackersDeclared), which carries no per-firing source, dropping the
-    // counter. The snapshot exists for ONE-SHOT delayed triggers whose end-step
-    // firing event lacks the source (Grave Betrayal, Liliana emblem); those keep
-    // it. `!one_shot` (a WheneverEvent) forces per-firing event-context
-    // resolution instead.
+    // Event-delayed triggers, including one-shot `WhenNextEvent`, must not
+    // snapshot TriggeringSource at creation: each firing resolves it from the
+    // event that actually fired the trigger. Only phase-delayed triggers need
+    // the creation-time fallback because their later phase event has no object
+    // subject.
     //
     // CR 603.7c: Computed ONCE here and reused for the creation-snapshot gate, the
-    // TriggeringSource origin-stamp gate, and the `DelayedTrigger.one_shot` field,
-    // so the three sites can never silently diverge. `condition`'s variant is not
-    // reassigned between them.
+    // `DelayedTrigger.one_shot` field. `condition`'s variant is not reassigned
+    // between them.
     let one_shot = !matches!(
         condition,
         crate::types::ability::DelayedTriggerCondition::WheneverEvent { .. }
@@ -252,7 +246,8 @@ pub fn resolve(
     // (`stamp_triggering_source_origins_in_ability_chain`, below); the
     // LastCreated arm names tokens, which cease to exist on a zone change
     // (CR 111.7) rather than returning as a new incarnation.
-    let (snapshot_targets, target_pins) = if one_shot
+    let creation_time_provenance = condition_uses_creation_time_provenance(&condition);
+    let (snapshot_targets, target_pins) = if creation_time_provenance
         && super::ability_refs_triggering_source(&delayed_ability)
     {
         // CR 603.7c: TriggeringSource always reads the event context (the dying
@@ -303,13 +298,10 @@ pub fn resolve(
     };
 
     // CR 603.7c: Stamp `ChangeZone.origin` from the CREATION event's
-    // TriggeringSource destination zone only for ONE-SHOT delayed triggers, whose
-    // later firing event (an end step / phase change) carries no source and so
-    // relies on the creation-time snapshot. A MULTI-FIRE WheneverEvent re-resolves
-    // TriggeringSource from EACH firing event, so freezing the origin to the
-    // creation event's zone would make a later firing from a different zone skip
-    // the zone move. Gated on the same `one_shot` flag as `snapshot_targets` above.
-    if one_shot && super::ability_refs_triggering_source(&delayed_ability) {
+    // TriggeringSource destination zone only for phase-delayed triggers, whose
+    // later firing event has no source and relies on the creation-time snapshot.
+    // Event-delayed triggers re-resolve TriggeringSource from their firing event.
+    if creation_time_provenance && super::ability_refs_triggering_source(&delayed_ability) {
         if let Some(zone) = triggering_source_destination_zone(state) {
             stamp_triggering_source_origins_in_ability_chain(&mut delayed_ability, zone);
         }
@@ -400,6 +392,24 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 603.7c: Only phase-delayed triggers lose their event subject between
+/// creation and firing. Event-based delayed triggers, including one-shot
+/// `WhenNextEvent`, must resolve `TriggeringSource` from the event that
+/// actually fires them.
+fn condition_uses_creation_time_provenance(condition: &DelayedTriggerCondition) -> bool {
+    match condition {
+        DelayedTriggerCondition::AtNextPhase { .. }
+        | DelayedTriggerCondition::AtNextPhaseForPlayer { .. } => true,
+        DelayedTriggerCondition::WhenLeavesPlay { .. }
+        | DelayedTriggerCondition::WhenDies { .. }
+        | DelayedTriggerCondition::WhenLeavesPlayFiltered { .. }
+        | DelayedTriggerCondition::WhenEntersBattlefield { .. }
+        | DelayedTriggerCondition::WhenDiesOrExiled { .. }
+        | DelayedTriggerCondition::WhenNextEvent { .. }
+        | DelayedTriggerCondition::WheneverEvent { .. } => false,
+    }
 }
 
 /// CR 603.7c + CR 608.2c: A delayed triggered ability that refers to a
@@ -1357,6 +1367,155 @@ mod tests {
         assert_eq!(
             state.delayed_triggers[0].condition,
             DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+        );
+    }
+
+    #[test]
+    fn only_phase_delayed_conditions_use_creation_time_provenance() {
+        let trigger = || Box::new(TriggerDefinition::new(TriggerMode::Taps));
+        assert!(condition_uses_creation_time_provenance(
+            &DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+        ));
+        assert!(condition_uses_creation_time_provenance(
+            &DelayedTriggerCondition::AtNextPhaseForPlayer {
+                phase: Phase::End,
+                player: PlayerId(0),
+                gate: Default::default(),
+            }
+        ));
+        for condition in [
+            DelayedTriggerCondition::WhenLeavesPlay {
+                object_id: ObjectId(1),
+            },
+            DelayedTriggerCondition::WhenDies {
+                filter: TargetFilter::Any,
+            },
+            DelayedTriggerCondition::WhenLeavesPlayFiltered {
+                filter: TargetFilter::Any,
+            },
+            DelayedTriggerCondition::WhenEntersBattlefield {
+                filter: TargetFilter::Any,
+            },
+            DelayedTriggerCondition::WhenDiesOrExiled {
+                filter: TargetFilter::Any,
+            },
+            DelayedTriggerCondition::WhenNextEvent {
+                trigger: trigger(),
+                or_trigger: Some(trigger()),
+                lifetime: Default::default(),
+            },
+            DelayedTriggerCondition::WheneverEvent {
+                trigger: trigger(),
+                expiry: Default::default(),
+            },
+        ] {
+            assert!(!condition_uses_creation_time_provenance(&condition));
+        }
+    }
+
+    /// CR 603.7c + CR 608.2k: an event-delayed TriggeringSource reads the
+    /// event that fires it, rather than retaining the unrelated creation event.
+    #[test]
+    fn when_next_event_uses_firing_event_triggering_source() {
+        let mut state = GameState::new_two_player(42);
+        let source = crate::game::zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Delayed source".to_string(),
+            Zone::Battlefield,
+        );
+        let creation_subject = crate::game::zones::create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Creation subject".to_string(),
+            Zone::Graveyard,
+        );
+        let firing_subject = crate::game::zones::create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Firing subject".to_string(),
+            Zone::Battlefield,
+        );
+        state.current_trigger_event = Some(GameEvent::ZoneChanged {
+            object_id: creation_subject,
+            from: Some(Zone::Battlefield),
+            to: Zone::Graveyard,
+            record: Box::new(crate::types::game_state::ZoneChangeRecord::test_minimal(
+                creation_subject,
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            )),
+        });
+
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.origin = Some(Zone::Battlefield);
+        trigger.destination = Some(Zone::Graveyard);
+        let effect = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::TriggeringSource,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        );
+        let ability = ResolvedAbility::new(
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::WhenNextEvent {
+                    trigger: Box::new(trigger),
+                    or_trigger: None,
+                    lifetime: Default::default(),
+                },
+                effect: Box::new(effect),
+                uses_tracked_set: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).expect("install delayed trigger");
+
+        match &state.delayed_triggers[0].ability.effect {
+            Effect::ChangeZone { origin, target, .. } => {
+                assert_eq!(
+                    *origin, None,
+                    "event-delayed origin is not creation-stamped"
+                );
+                assert_eq!(*target, TargetFilter::TriggeringSource);
+            }
+            other => panic!("expected ChangeZone, got {other:?}"),
+        }
+        assert!(
+            state.delayed_triggers[0].ability.targets.is_empty(),
+            "event-delayed TriggeringSource must not snapshot the creation subject"
+        );
+
+        crate::game::zones::move_to_zone(&mut state, firing_subject, Zone::Graveyard, &mut events);
+        crate::game::triggers::check_delayed_triggers(&mut state, &events);
+        crate::game::stack::resolve_top(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&creation_subject].zone,
+            Zone::Graveyard,
+            "the creation event's subject must remain untouched"
+        );
+        assert_eq!(
+            state.objects[&firing_subject].zone,
+            Zone::Battlefield,
+            "the firing event's subject must be returned"
         );
     }
 
