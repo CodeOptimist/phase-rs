@@ -6766,7 +6766,7 @@ fn apply_action(
 
     let mut events = Vec::new();
     let mut triggers_processed_inline = false;
-    let mut skip_deferred_trigger_drain = false;
+    let skip_deferred_trigger_drain = false;
 
     // CancelAutoPass works from any WaitingFor state (player may cancel during
     // interactive choices). Routed by `actor` — previously used
@@ -10400,13 +10400,6 @@ fn apply_action(
                     waiting_for,
                 ) => {
                     triggers_processed_inline = true;
-                    waiting_for
-                }
-                engine_resolution_choices::ResolutionChoiceOutcome::WaitingForWithParkedObservers(
-                    waiting_for,
-                ) => {
-                    triggers_processed_inline = true;
-                    skip_deferred_trigger_drain = true;
                     waiting_for
                 }
                 engine_resolution_choices::ResolutionChoiceOutcome::ActionResult(result) => {
@@ -15887,7 +15880,10 @@ mod stage2_injector_tests {
                 // `scoped_library_search.rs`, neither of which this change touches, and the
                 // test module it adds contains no line matching the needle — total still 37,
                 // partition still 5/7/25.
-                "game/engine.rs:11828".to_string(),
+                // Search-observer dispatch: `:11828 ⇒ :11821`, −7. Removing the retired
+                // `WaitingForWithParkedObservers` match arm is the only hunk above this
+                // producer; it changes trigger-drain timing but does not add a prompt.
+                "game/engine.rs:11821".to_string(),
             ],
             "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
              plus the two repeated-optional-payment drivers, the per-player acceptance cursor \
