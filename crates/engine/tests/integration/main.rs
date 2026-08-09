@@ -44,6 +44,7 @@ mod baleful_mastery_regression;
 mod banding_combat;
 mod bards_company_recruit;
 mod batched_trigger_subject_count;
+mod batroc_the_leaper_multikicker_counters;
 mod battle_of_wits;
 mod battlefield_entry_authority_census;
 mod bbfu10_entered_this_turn_snapshot;
