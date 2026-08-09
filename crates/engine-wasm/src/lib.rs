@@ -125,10 +125,28 @@ fn format_diagnostic_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn decode_restored_game_state(json_str: &str) -> Result<GameState, String> {
-    serde_json::from_str::<PersistedGameState>(json_str)
+#[derive(Debug)]
+struct DecodedRestoredGameState {
+    state: GameState,
+    debug_permitted_was_serialized: bool,
+}
+
+fn decode_restored_game_state(json_str: &str) -> Result<DecodedRestoredGameState, String> {
+    let serialized = serde_json::from_str::<serde_json::Value>(json_str)
+        .map_err(|error| format!("Failed to deserialize GameState: {error}"))?;
+    let state = serialized
+        .get("state")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| serialized.as_object());
+    let debug_permitted_was_serialized =
+        state.is_some_and(|state| state.contains_key("debug_permitted"));
+    let state = serde_json::from_value::<PersistedGameState>(serialized)
         .map(PersistedGameState::into_game_state)
-        .map_err(|error| format!("Failed to deserialize GameState: {error}"))
+        .map_err(|error| format!("Failed to deserialize GameState: {error}"))?;
+    Ok(DecodedRestoredGameState {
+        state,
+        debug_permitted_was_serialized,
+    })
 }
 
 /// Bind the engine's interaction authority for the one game this module hosts.
@@ -914,18 +932,7 @@ pub fn initialize_game(
     }
 
     let mut state = GameState::new(format_config.clone(), count, seed);
-    state.debug_mode = true;
-    // Sandbox capability: in a P2P-host (WASM-authoritative) game, the
-    // `submit_action` gate checks `debug_permitted`, mirroring server-core's
-    // WebSocket gate. server-core seeds every seat when `allow_debug_actions`
-    // is set (session.rs); the WASM host must do the same or sandbox Debug
-    // actions are rejected for everyone — the host included. Every seat is
-    // permitted by default; the host's grant/revoke flow still narrows it.
-    if state.format_config.allow_debug_actions {
-        for i in 0..count {
-            state.debug_permitted.insert(PlayerId(i));
-        }
-    }
+    initialize_debug_permissions(&mut state, is_multiplayer_mode());
     let match_config = if !match_config_js.is_null() && !match_config_js.is_undefined() {
         serde_wasm_bindgen::from_value::<MatchConfig>(match_config_js)
             .unwrap_or_else(|_| MatchConfig::default())
@@ -1566,8 +1573,8 @@ pub fn legal_targets_for_castables_js(object_ids: JsValue) -> JsValue {
 /// the TS side accepts it via structural typing.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ViewerSnapshot {
-    state: GameState,
+struct ViewerSnapshot<'a> {
+    state: engine::game::derived_views::ClientGameStateRef<'a>,
     actions: Vec<GameAction>,
     auto_pass_recommended: bool,
     end_continuous_effect_offers: Vec<GameAction>,
@@ -1608,6 +1615,7 @@ fn legal_actions_result_for_viewer(state: &GameState, viewer: PlayerId) -> Legal
 #[cfg(test)]
 mod viewer_priority_tests {
     use super::*;
+    use engine::types::format::FormatConfig;
     use engine::types::game_state::{PriorityPassingMode, WaitingFor};
     use engine::types::phase::Phase;
 
@@ -1646,6 +1654,23 @@ mod viewer_priority_tests {
             "the controlled viewer is not authorized to act and must receive false"
         );
     }
+
+    #[test]
+    fn local_debug_permission_is_explicit_but_non_sandbox_p2p_stays_empty() {
+        let mut local = GameState::new(FormatConfig::standard(), 2, 42);
+        initialize_debug_permissions(&mut local, false);
+        assert!(local.debug_mode);
+        assert!(local.debug_permitted.contains(&PlayerId(0)));
+        assert!(!local.debug_permitted.contains(&PlayerId(1)));
+
+        let mut p2p = GameState::new(FormatConfig::standard(), 2, 42);
+        initialize_debug_permissions(&mut p2p, true);
+        assert!(p2p.debug_mode);
+        assert!(
+            p2p.debug_permitted.is_empty(),
+            "normal P2P must not receive the debug-library capability"
+        );
+    }
 }
 
 #[wasm_bindgen]
@@ -1658,7 +1683,11 @@ pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
         let viewer_interaction =
             engine::game::interaction::derive_viewer_interaction(state, &filtered, viewer);
         to_js(&ViewerSnapshot {
-            state: filtered,
+            state: engine::game::derived_views::ClientGameStateRef::wrap_filtered(
+                state,
+                &filtered,
+                Some(viewer),
+            ),
             actions: legal.actions,
             auto_pass_recommended: legal.auto_pass_recommended,
             end_continuous_effect_offers: legal.end_continuous_effect_offers,
@@ -1808,10 +1837,46 @@ fn rehydrate_restored_state_from_card_db(state: &mut GameState) -> Result<(), St
     })
 }
 
-fn decode_and_rehydrate_restored_game_state(json_str: &str) -> Result<GameState, String> {
-    let mut state = decode_restored_game_state(json_str)?;
-    rehydrate_restored_state_from_card_db(&mut state)?;
-    Ok(state)
+fn decode_and_rehydrate_restored_game_state(
+    json_str: &str,
+) -> Result<DecodedRestoredGameState, String> {
+    let mut restored = decode_restored_game_state(json_str)?;
+    rehydrate_restored_state_from_card_db(&mut restored.state)?;
+    Ok(restored)
+}
+
+/// Sets the explicit debug capability that client projections consume. Local
+/// games authorize their perspective seat; multiplayer reserves debug access
+/// for the sandbox permission set so ordinary P2P games cannot expose it.
+fn initialize_debug_permissions(state: &mut GameState, multiplayer: bool) {
+    state.debug_mode = true;
+    if state.format_config.allow_debug_actions {
+        state
+            .debug_permitted
+            .extend(state.players.iter().map(|player| player.id));
+    } else if !multiplayer {
+        state.debug_permitted.insert(PlayerId(0));
+    }
+}
+
+/// Reconstructs the capability set omitted by saves created before
+/// `debug_permitted` was persisted. Current saves carry the field even when
+/// its intentionally empty, so their grant/revoke state remains authoritative.
+fn backfill_legacy_debug_permissions(
+    state: &mut GameState,
+    debug_permitted_was_serialized: bool,
+    multiplayer: bool,
+) {
+    if debug_permitted_was_serialized {
+        return;
+    }
+    if state.format_config.allow_debug_actions {
+        state
+            .debug_permitted
+            .extend(state.players.iter().map(|player| player.id));
+    } else if !multiplayer {
+        state.debug_permitted.insert(PlayerId(0));
+    }
 }
 
 #[cfg(test)]
@@ -1838,8 +1903,9 @@ pub fn restore_game_state(json_str: &str) -> Result<(), JsValue> {
             "restore_game_state refused: undo is disabled in multiplayer sessions",
         ));
     }
-    let mut state = decode_and_rehydrate_restored_game_state(json_str)
+    let restored = decode_and_rehydrate_restored_game_state(json_str)
         .map_err(|error| JsValue::from_str(&error))?;
+    let mut state = restored.state;
     // Reseed the skipped `rng` and fast-forward it to the offset captured at
     // export (issue #5466) so the restored game draws the values that would have
     // come NEXT rather than replaying from origin. The engine owns this logic
@@ -1847,6 +1913,7 @@ pub fn restore_game_state(json_str: &str) -> Result<(), JsValue> {
     // and reproduce the previous rewind-to-origin behavior.
     state.rehydrate_rng();
     state.debug_mode = true;
+    backfill_legacy_debug_permissions(&mut state, restored.debug_permitted_was_serialized, false);
     finalize_public_state(&mut state);
     bind_interaction_session(&mut state);
     GAME_STATE.with(|cell| cell.set(Some(state)));
@@ -1899,8 +1966,10 @@ pub fn resume_multiplayer_host_state(json_str: &str) -> Result<(), JsValue> {
         ));
     }
 
-    let mut state = decode_and_rehydrate_restored_game_state(json_str)
+    let restored = decode_and_rehydrate_restored_game_state(json_str)
         .map_err(|error| JsValue::from_str(&error))?;
+    let mut state = restored.state;
+    backfill_legacy_debug_permissions(&mut state, restored.debug_permitted_was_serialized, true);
 
     // Deliberately re-roll a fresh seed on multiplayer host resume so continued
     // play diverges from any pre-save sequence (mirrors server-core). This is a
@@ -1943,6 +2012,72 @@ mod restored_card_db_requirements_tests {
         assert!(error.contains("card database"));
         assert!(GAME_STATE.with(|cell| cell.replace(None).is_none()));
         assert!(!is_multiplayer_mode());
+    }
+}
+
+#[cfg(test)]
+mod legacy_debug_permission_restore_tests {
+    use super::*;
+
+    fn legacy_save_without_debug_permissions(state: GameState) -> String {
+        let mut serialized = serde_json::to_value(PersistedGameState::capture(state))
+            .expect("persisted test state must serialize");
+        serialized
+            .get_mut("state")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("trusted persisted state must contain a state object")
+            .remove("debug_permitted");
+        serde_json::to_string(&serialized).expect("legacy persisted test state must serialize")
+    }
+
+    #[test]
+    fn legacy_sandbox_save_backfills_every_seat() {
+        let json = legacy_save_without_debug_permissions(GameState::new(
+            FormatConfig::standard().with_sandbox(),
+            2,
+            42,
+        ));
+
+        let mut restored = decode_restored_game_state(&json).expect("legacy save must decode");
+        assert!(!restored.debug_permitted_was_serialized);
+        backfill_legacy_debug_permissions(&mut restored.state, false, false);
+
+        assert_eq!(
+            restored.state.debug_permitted,
+            [PlayerId(0), PlayerId(1)].into_iter().collect(),
+            "legacy sandbox saves predate per-seat grants and must retain sandbox access"
+        );
+    }
+
+    #[test]
+    fn current_empty_sandbox_permission_set_remains_revoked() {
+        let mut state = GameState::new(FormatConfig::standard().with_sandbox(), 2, 42);
+        state.debug_permitted.clear();
+        let json = serde_json::to_string(&PersistedGameState::capture(state))
+            .expect("current persisted state must serialize");
+
+        let mut restored = decode_restored_game_state(&json).expect("current save must decode");
+        assert!(restored.debug_permitted_was_serialized);
+        backfill_legacy_debug_permissions(&mut restored.state, true, false);
+
+        assert!(
+            restored.state.debug_permitted.is_empty(),
+            "an explicit empty set records intentional sandbox revocation"
+        );
+    }
+
+    #[test]
+    fn legacy_normal_p2p_save_does_not_gain_debug_access() {
+        let json =
+            legacy_save_without_debug_permissions(GameState::new(FormatConfig::standard(), 2, 42));
+
+        let mut restored = decode_restored_game_state(&json).expect("legacy save must decode");
+        backfill_legacy_debug_permissions(&mut restored.state, false, true);
+
+        assert!(
+            restored.state.debug_permitted.is_empty(),
+            "normal P2P restores must not gain a debug projection"
+        );
     }
 }
 
