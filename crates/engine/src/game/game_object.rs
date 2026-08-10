@@ -239,6 +239,25 @@ pub struct BackFaceData {
     pub strive_cost: Option<ManaCost>,
     pub casting_restrictions: Vec<CastingRestriction>,
     pub casting_options: Vec<SpellCastingOption>,
+    /// Parser diagnostics for THIS face — the `BackFaceData` half of
+    /// [`GameObject::parse_warnings`], and per-face for the same reason `abilities`
+    /// is: the two faces are parsed independently, so a card whose front reads
+    /// cleanly and whose back does not is the normal case rather than a corner one.
+    ///
+    /// Without this field the diagnostic was not a per-face fact at all. Face
+    /// application copies field by field, so a transform kept the FRONT face's
+    /// diagnostics on the object while displaying the back face's rules text: a
+    /// front-clean card looked clean after transforming into a back face the parser
+    /// could not fully read, and a front-dirty one kept a diagnostic that no longer
+    /// described anything. `ai_support::shortcut_efficacy` reads the object field as
+    /// evidence that the printed rules text is fully modelled, so the stale answer
+    /// was load-bearing in both directions.
+    ///
+    /// `serde(default)` keeps every persisted dump loadable — an older
+    /// `BackFaceData` simply carries no diagnostics — and `skip_serializing_if`
+    /// keeps a clean parse byte-identical on the way out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_warnings: Vec<crate::parser::oracle_ir::diagnostic::OracleDiagnostic>,
     /// Source layout kind — distinguishes Modal DFCs from Transform DFCs
     /// so the engine can offer face-choice for MDFCs (CR 712.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,6 +567,38 @@ pub struct GameObject {
     /// `DraftFromSpellbook` resolver to present the choice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spellbook: Vec<String>,
+
+    /// Parser diagnostics for the DISPLAYED face, copied verbatim from
+    /// `CardFace::parse_warnings` by `game::printed_cards`. A transform swaps this
+    /// along with the rest of the face, through [`BackFaceData::parse_warnings`] —
+    /// the two faces parse independently, so a card can be clean on one and not the
+    /// other, and reporting the wrong face's diagnostics is worse than reporting
+    /// none.
+    ///
+    /// NOT a rules field, and it does not change how anything resolves. It is
+    /// carried onto the object because a diagnostic is EVIDENCE ABOUT the rules
+    /// content: it records that the parser saw printed text it could not turn
+    /// into an `AbilityDefinition`. `game::coverage` already reads the same list
+    /// off the face to decide whether a card is supported. Any consumer that
+    /// wants to prove an object's printed rules text is fully modelled has to be
+    /// able to see that the parse was lossy, and before this field existed that
+    /// evidence stopped at the card database.
+    ///
+    /// `skip_serializing_if` keeps every existing dump byte-identical: the field
+    /// is empty for a clean parse, which is the overwhelming majority of objects.
+    ///
+    /// DELIBERATELY ABSENT FROM `CopiableValues`. CR 707.2 gives a copy the
+    /// copiable values of the original's CHARACTERISTICS, and CR 707.2a says why
+    /// the abilities come along: "those values are derived from its rules text".
+    /// A parse diagnostic is not derived from the rules text — it is a statement
+    /// about this engine's READING of it — so it is not a characteristic and a
+    /// copy does not acquire it. The consequence, stated rather than left to be
+    /// discovered: a token copy carries the source's `abilities` but its own
+    /// (empty) diagnostics. That is exactly the coverage a copy had before this
+    /// field existed; the field narrows the gap for printed objects and leaves
+    /// the copy case where it already was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_warnings: Vec<crate::parser::oracle_ir::diagnostic::OracleDiagnostic>,
 
     // Back face data for double-faced cards (DFCs)
     pub back_face: Option<BackFaceData>,
@@ -1270,6 +1321,17 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         token_image_ref: _,
         source_related_token_ids: _,
         spellbook: _,
+        // OMITTED, SAFE BY WRITE SITE. Every write is a FACE INSTALL:
+        // `printed_cards::apply_card_face_to_object` (front) and
+        // `apply_back_face_to_object` (the face a transform swaps in), each a verbatim
+        // clone of that face's own diagnostics, plus the two `game::visibility`
+        // redactions which act on a projected copy and never on stored state. So the
+        // field is a function of WHICH FACE IS DISPLAYED, and `transformed` — compared
+        // above — is that same function's discriminator: two states this comparator
+        // calls equal are showing the same face of the same card, and therefore agree
+        // here. Nothing accumulates in it, so it cannot become the per-iteration drift
+        // the §5.2c ADD set exists to catch.
+        parse_warnings: _,
         back_face: _,
         specialize_faces: _,
         specialized_color: _,
@@ -2144,6 +2206,7 @@ impl GameObject {
             token_image_ref: None,
             source_related_token_ids: Vec::new(),
             spellbook: Vec::new(),
+            parse_warnings: Vec::new(),
             back_face: None,
             specialize_faces: None,
             specialized_color: None,
