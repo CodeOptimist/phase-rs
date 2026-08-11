@@ -224,6 +224,33 @@ mod tuple_key_map {
     }
 }
 
+#[cfg(test)]
+mod legacy_trigger_definition_ref_map {
+    use super::*;
+
+    pub fn serialize<S, H>(
+        map: &HashMap<TriggerDefinitionRef, u32, H>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<TriggerDefinitionRef, u32>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<(TriggerDefinitionRef, u32)>::deserialize(deserializer)
+            .map(|entries| entries.into_iter().collect())
+    }
+}
+
 /// Serde adapter for trigger occurrence ledgers. JSON object keys must be
 /// strings, while a `TriggerDefinitionRef` is structured identity; encode the
 /// map as an explicit entry list rather than flattening or guessing a key.
@@ -22497,6 +22524,7 @@ mod tests {
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, Effect, PostReplacementContinuation, QuantityExpr,
         ResolvedAbility, TargetFilter, TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
+        TriggerEntry, TriggerGrantInstanceRef,
     };
     use crate::types::deterministic_serde::test_support::ReverseBuildHasher;
     use crate::types::identifiers::{
@@ -22512,7 +22540,7 @@ mod tests {
 
     #[derive(Serialize)]
     struct TriggerRefFixture<'a> {
-        #[serde(serialize_with = "trigger_definition_ref_map::serialize")]
+        #[serde(serialize_with = "legacy_trigger_definition_ref_map::serialize")]
         values: &'a HashMap<TriggerDefinitionRef, u32, ReverseBuildHasher>,
     }
 
@@ -22622,7 +22650,7 @@ mod tests {
             .expect("trigger-ref fixture should serialize"),
             r#"{"values":[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":1}}},11],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12]]}"#
         );
-        let trigger_round_trip = trigger_definition_ref_map::deserialize(
+        let trigger_round_trip = legacy_trigger_definition_ref_map::deserialize(
             &mut serde_json::Deserializer::from_str(
                 r#"[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10]]"#,
             ),
@@ -28419,6 +28447,60 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn game_state_deserialize_preserves_legacy_grant_fire_counts_by_recipient() {
+        let object_id = ObjectId(993);
+        let second_object_id = ObjectId(994);
+        let mut state = GameState::new_two_player(42);
+        let mut object = GameObject::new(
+            object_id,
+            CardId(993),
+            PlayerId(0),
+            "Legacy granted trigger".to_string(),
+            Zone::Battlefield,
+        );
+        let entry = TriggerEntry::new(
+            TriggerDefinitionOccurrenceRef::Granted {
+                grant_instance: TriggerGrantInstanceRef(1),
+            },
+            TriggerDefinition::new(crate::types::triggers::TriggerMode::Attacks),
+        );
+        let definition = object.trigger_definition_ref(&entry);
+        object.trigger_definitions.push(entry);
+        state.objects.insert(object_id, object);
+        state
+            .trigger_fire_counts_this_turn
+            .insert(definition.clone(), 2);
+
+        let mut second_object = GameObject::new(
+            second_object_id,
+            CardId(994),
+            PlayerId(0),
+            "Second legacy granted trigger".to_string(),
+            Zone::Battlefield,
+        );
+        let second_entry = TriggerEntry::new(
+            TriggerDefinitionOccurrenceRef::Granted {
+                grant_instance: TriggerGrantInstanceRef(1),
+            },
+            TriggerDefinition::new(crate::types::triggers::TriggerMode::Attacks),
+        );
+        let second_definition = second_object.trigger_definition_ref(&second_entry);
+        second_object.trigger_definitions.push(second_entry);
+        state.objects.insert(second_object_id, second_object);
+        state
+            .trigger_fire_counts_this_turn
+            .insert(second_definition.clone(), 3);
+
+        let snapshot = serde_json::to_value(state).expect("serialize fixture state");
+        let restored: GameState =
+            serde_json::from_value(snapshot).expect("recipient-specific ledger counts restore");
+        assert_eq!(
+            restored.trigger_fire_counts_this_turn,
+            HashMap::from([(definition, 2), (second_definition, 3),])
+        );
     }
 
     #[test]

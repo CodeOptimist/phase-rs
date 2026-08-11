@@ -92,25 +92,21 @@ mod trigger_occurrence_tests {
     fn identical_grants_from_distinct_producers_remain_distinct_entries() {
         let definition = TriggerDefinition::new(TriggerMode::Attacks);
         let mut state = TriggerOccurrenceState::default();
+        let first_producer = TriggerGrantProducerKey::Granted {
+            origin: static_origin(),
+            output_index: 0,
+        };
+        let second_producer = TriggerGrantProducerKey::Granted {
+            origin: TriggerProducerOrigin::Transient {
+                continuous_effect_id: 19,
+                modification_index: 0,
+            },
+            output_index: 0,
+        };
         let entries = state
             .reconcile_trigger_entries(vec![
-                (
-                    TriggerGrantProducerKey::Granted {
-                        origin: static_origin(),
-                        output_index: 0,
-                    },
-                    definition.clone(),
-                ),
-                (
-                    TriggerGrantProducerKey::Granted {
-                        origin: TriggerProducerOrigin::Transient {
-                            continuous_effect_id: 19,
-                            modification_index: 0,
-                        },
-                        output_index: 0,
-                    },
-                    definition,
-                ),
+                (first_producer.clone(), definition.clone()),
+                (second_producer.clone(), definition),
             ])
             .unwrap();
         assert_eq!(entries.len(), 2);
@@ -178,31 +174,6 @@ mod trigger_occurrence_tests {
             .unwrap()[0]
             .0;
         assert_eq!(instance, TriggerGrantInstanceRef(1));
-    }
-
-    #[test]
-    fn abandoning_a_recipient_retires_grants_without_rewinding_the_allocator() {
-        let producer = TriggerGrantProducerKey::Granted {
-            origin: static_origin(),
-            output_index: 0,
-        };
-        let mut state = TriggerOccurrenceState::default();
-        let first = state
-            .reconcile_grant_instances(vec![(producer.clone(), ())])
-            .unwrap()[0]
-            .0;
-
-        state.retire_all_grants();
-        assert_eq!(state.active_grants().count(), 0);
-
-        let replacement = state
-            .reconcile_grant_instances(vec![(producer, ())])
-            .unwrap()[0]
-            .0;
-        assert!(
-            replacement.0 > first.0,
-            "an abandoned recipient must not resurrect a retired grant generation"
-        );
     }
 }
 
@@ -21845,7 +21816,7 @@ pub struct CopyEffectInstanceRef {
 
 /// Payload-free identity of the continuous-effect occurrence which produced a
 /// Layer-6 trigger candidate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum TriggerProducerOrigin {
     Static {
@@ -21864,7 +21835,7 @@ pub enum TriggerProducerOrigin {
 /// This is deliberately independent of `TriggerDefinition`: byte-identical
 /// grants from distinct producers remain independently functioning abilities
 /// (CR 113.2c).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum TriggerGrantProducerKey {
     KeywordCompanion {
@@ -22000,7 +21971,10 @@ impl<'de> Deserialize<'de> for TriggerEntry {
             TriggerEntryWire::IdentityBearing {
                 occurrence,
                 definition,
-            } => Ok(Self::new(occurrence, definition)),
+            } => Ok(Self {
+                occurrence,
+                definition,
+            }),
             // A later GameState normalization validates this only for a
             // provable printed/base slot. Keeping the marker here preserves the
             // distinction instead of guessing copied/granted provenance from
@@ -22182,13 +22156,6 @@ impl TriggerOccurrenceState {
     pub fn retire_absent_grants(&mut self, live_instances: &[TriggerGrantInstanceRef]) {
         self.active_grants
             .retain(|active| live_instances.contains(&active.instance));
-    }
-
-    /// Retires every active producer while preserving the monotonic allocator.
-    /// A player-left-game transition abandons the recipient permanently; a
-    /// future allocation must never resurrect one of its former grants.
-    pub fn retire_all_grants(&mut self) {
-        self.active_grants.clear();
     }
 
     pub fn active_grants(
