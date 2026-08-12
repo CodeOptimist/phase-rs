@@ -3087,12 +3087,25 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "Retrace" => Ok(Keyword::Retrace),
         "SplitSecond" => Ok(Keyword::SplitSecond),
         "Storm" => Ok(Keyword::Storm),
-        "Suspend" => Ok(Keyword::Suspend {
-            count: 0,
-            cost: ManaCost::default(),
-        }),
-        "Gift" => Ok(Keyword::Gift(GiftKind::Card)),
-        "Discover" => Ok(Keyword::Discover(0)),
+        "Suspend" => {
+            let object = data.as_object().ok_or("Suspend: expected object")?;
+            let count = object
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("Suspend: missing count")?;
+            let count = u32::try_from(count).map_err(|_| "Suspend: count exceeds u32")?;
+            let cost = object.get("cost").ok_or("Suspend: missing cost")?;
+            Ok(Keyword::Suspend {
+                count,
+                cost: mana(cost)?,
+            })
+        }
+        "Gift" => serde_json::from_value(data.clone())
+            .map(Keyword::Gift)
+            .map_err(|error| format!("GiftKind: {error}")),
+        "Discover" => serde_json::from_value(data.clone())
+            .map(Keyword::Discover)
+            .map_err(|error| format!("Discover: {error}")),
         "Spree" => Ok(Keyword::Spree),
         "Ravenous" => Ok(Keyword::Ravenous),
         "Daybound" => Ok(Keyword::Daybound),
@@ -3130,7 +3143,9 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "CumulativeUpkeep" => Ok(Keyword::CumulativeUpkeep(AbilityCost::Mana {
             cost: ManaCost::zero(),
         })),
-        "Ripple" => Ok(Keyword::Ripple(1)),
+        "Ripple" => serde_json::from_value(data.clone())
+            .map(Keyword::Ripple)
+            .map_err(|error| format!("Ripple: {error}")),
         "Totem" => Ok(Keyword::Totem),
         // Parameterized: ManaCost (new keywords)
         "Warp" => Ok(Keyword::Warp(mana(data)?)),
@@ -4668,6 +4683,36 @@ mod tests {
         let json = serde_json::to_string(&keywords).unwrap();
         let deserialized: Vec<Keyword> = serde_json::from_str(&json).unwrap();
         assert_eq!(keywords, deserialized);
+    }
+
+    #[test]
+    fn tagged_keyword_payloads_deserialize_without_substitution() {
+        let gift: Keyword = serde_json::from_str(r#"{"Gift":{"type":"TappedFish"}}"#)
+            .expect("Gift payload deserializes");
+        assert_eq!(gift, Keyword::Gift(GiftKind::TappedFish));
+
+        let discover: Keyword =
+            serde_json::from_str(r#"{"Discover": 7}"#).expect("Discover payload deserializes");
+        assert_eq!(discover, Keyword::Discover(7));
+
+        let ripple: Keyword =
+            serde_json::from_str(r#"{"Ripple": 4}"#).expect("Ripple payload deserializes");
+        assert_eq!(ripple, Keyword::Ripple(4));
+
+        let suspend: Keyword = serde_json::from_str(
+            r#"{"Suspend":{"count":4,"cost":{"type":"Cost","shards":["Blue"],"generic":0}}}"#,
+        )
+        .expect("Suspend payload deserializes");
+        assert_eq!(
+            suspend,
+            Keyword::Suspend {
+                count: 4,
+                cost: ManaCost::Cost {
+                    shards: vec![crate::types::mana::ManaCostShard::Blue],
+                    generic: 0,
+                },
+            }
+        );
     }
 
     #[test]
