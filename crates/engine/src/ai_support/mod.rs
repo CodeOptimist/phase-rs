@@ -6171,7 +6171,7 @@ mod tests {
     }
 
     #[test]
-    fn target_selection_legal_actions_use_current_targets_without_simulation() {
+    fn target_selection_legal_actions_use_current_targets_with_reducer_validation() {
         let mut state = setup_priority();
         let targets: Vec<TargetRef> = (0..25)
             .map(|i| {
@@ -6198,13 +6198,22 @@ mod tests {
         state.waiting_for = WaitingFor::TargetSelection {
             player: PlayerId(0),
             pending_cast,
-            target_slots: vec![crate::types::game_state::TargetSelectionSlot {
-                legal_targets: targets.clone(),
-                optional: true,
-                chooser: None,
-                effect_kind: EffectKind::NoOp,
-                effect_detail: TargetEffectDetail::None,
-            }],
+            target_slots: vec![
+                crate::types::game_state::TargetSelectionSlot {
+                    legal_targets: targets.clone(),
+                    optional: true,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
+                },
+                crate::types::game_state::TargetSelectionSlot {
+                    legal_targets: vec![targets[0].clone()],
+                    optional: true,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
+                },
+            ],
             mode_labels: Vec::new(),
             selection: crate::types::game_state::TargetSelectionProgress {
                 current_slot: 0,
@@ -6213,12 +6222,8 @@ mod tests {
             },
         };
 
-        crate::game::perf_counters::reset();
         let (actions, spell_costs, grouped) = legal_actions_full(&state);
-        let counters = crate::game::perf_counters::snapshot();
 
-        assert_eq!(counters.state_clone_for_legality, 0);
-        assert_eq!(counters.priority_cast_probe_builds, 0);
         assert_eq!(
             actions
                 .iter()
@@ -6227,7 +6232,8 @@ mod tests {
             25
         );
         assert!(actions.contains(&GameAction::ChooseTarget { target: None }));
-        assert_eq!(actions.len(), 26);
+        assert_eq!(actions.len(), 27);
+        assert!(actions.contains(&GameAction::CancelCast));
         assert!(spell_costs.is_empty());
         assert!(grouped.is_empty());
         assert!(actions
@@ -6601,13 +6607,22 @@ mod tests {
         state.waiting_for = WaitingFor::TargetSelection {
             player: PlayerId(0),
             pending_cast,
-            target_slots: vec![crate::types::game_state::TargetSelectionSlot {
-                legal_targets: vec![target.clone()],
-                optional: true,
-                chooser: None,
-                effect_kind: EffectKind::NoOp,
-                effect_detail: TargetEffectDetail::None,
-            }],
+            target_slots: vec![
+                crate::types::game_state::TargetSelectionSlot {
+                    legal_targets: vec![target.clone()],
+                    optional: true,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
+                },
+                crate::types::game_state::TargetSelectionSlot {
+                    legal_targets: vec![target.clone()],
+                    optional: true,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
+                },
+            ],
             mode_labels: Vec::new(),
             selection: crate::types::game_state::TargetSelectionProgress {
                 current_slot: 0,
@@ -6616,14 +6631,16 @@ mod tests {
             },
         };
 
-        crate::game::perf_counters::reset();
         let (actions, _spell_costs, _grouped) = legal_actions_full(&state);
 
-        assert_eq!(
-            crate::game::perf_counters::snapshot().state_clone_for_legality,
-            0
+        assert!(actions.contains(&GameAction::ChooseTarget { target: None }));
+        assert!(actions.contains(&GameAction::CancelCast));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, GameAction::ChooseTarget { target: Some(_) })),
+            "stale slot targets must not be reissued"
         );
-        assert_eq!(actions, vec![GameAction::ChooseTarget { target: None }]);
     }
 
     /// False-positive sweep (CR 103.5 / TL:R 906.6a): the simultaneous
