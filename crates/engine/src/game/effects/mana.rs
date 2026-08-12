@@ -199,6 +199,7 @@ pub fn resolve(
                 state,
                 ability.source_id,
                 Some(ability),
+                Some(count_ability),
             )
         })
         .flatten();
