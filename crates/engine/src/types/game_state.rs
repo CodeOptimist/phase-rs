@@ -5947,7 +5947,6 @@ pub enum PendingCostMoveCompletion {
         phyrexian_choices: Option<Vec<ShardChoice>>,
         cascade_cast_transformed: bool,
         resolution_success_waiting_for: Option<Box<WaitingFor>>,
-        pool_before: usize,
         prepaid_actual_mana_spent: Option<u32>,
     },
 }
