@@ -18940,8 +18940,13 @@ pub struct AbilityDefinition {
     pub optional_targeting: bool,
     /// CR 608.2d: When true, the controller chooses whether to perform this effect ("You may X").
     pub optional: bool,
+    /// CR 608.2d: Event-relative player named by an optional subject (for example,
+    /// "they may"). Unlike `optional_for` and `target_chooser`, this selects the
+    /// resolution-time optional actor; `None` uses this ability's controller.
+    pub optional_player: Option<TargetFilter>,
     /// CR 608.2d: When set, an opponent (not the controller) chooses whether to perform this
-    /// optional effect. Requires `optional: true`. Opponents are prompted in APNAP order.
+    /// optional effect. Unlike `optional_player` and `target_chooser`, this is an
+    /// any-opponent permission. Requires `optional: true`; prompts use APNAP order.
     pub optional_for: Option<OpponentMayScope>,
     /// Variable-count targeting: min/max targets the player can choose.
     /// When present, resolution enters MultiTargetSelection instead of immediate resolve.
@@ -19021,8 +19026,8 @@ pub struct AbilityDefinition {
     /// CR 601.2c + CR 603.3d: When set, this player (not the controller) announces
     /// this ability's target(s) at stack placement. `None` = controller chooses
     /// (default). Mirrors `target_selection_mode` (the same "by-whom are targets
-    /// selected" axis). Distinct from CR 608.2d resolution-time "of their choice"
-    /// sacrifices.
+    /// selected" axis). Unlike `optional_player` and `optional_for`, this is a
+    /// stack-placement target choice, not a resolution-time optional actor.
     pub target_chooser: Option<TargetFilter>,
     /// CR 608.2c + CR 107.1c: per-iteration loop-continuation predicate, the
     /// non-count companion to `repeat_for`. When `Some`, the resolution chain
@@ -19083,6 +19088,8 @@ struct AbilityDefinitionRepr<'a> {
     condition: &'a Option<AbilityCondition>,
     optional_targeting: bool,
     optional: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optional_player: &'a Option<TargetFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     optional_for: &'a Option<OpponentMayScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19150,6 +19157,7 @@ impl Serialize for AbilityDefinition {
             condition,
             optional_targeting,
             optional,
+            optional_player,
             optional_for,
             multi_target,
             target_constraints,
@@ -19191,6 +19199,7 @@ impl Serialize for AbilityDefinition {
             condition,
             optional_targeting: *optional_targeting,
             optional: *optional,
+            optional_player,
             optional_for,
             multi_target,
             target_constraints,
@@ -19282,6 +19291,8 @@ struct AbilityDefinitionDe {
     #[serde(default)]
     optional: bool,
     #[serde(default)]
+    optional_player: Option<TargetFilter>,
+    #[serde(default)]
     optional_for: Option<OpponentMayScope>,
     #[serde(default)]
     multi_target: Option<MultiTargetSpec>,
@@ -19354,6 +19365,7 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
             condition: de.condition,
             optional_targeting: de.optional_targeting,
             optional: de.optional,
+            optional_player: de.optional_player,
             optional_for: de.optional_for,
             multi_target: de.multi_target,
             target_constraints: de.target_constraints,
@@ -19550,6 +19562,7 @@ impl AbilityDefinition {
             condition: None,
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
@@ -24402,6 +24415,9 @@ pub struct ResolvedAbility {
     /// CR 608.2d: Optional effect — controller prompted before execution.
     #[serde(default)]
     pub optional: bool,
+    /// CR 608.2d: Event-relative player explicitly named by an optional subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional_player: Option<TargetFilter>,
     /// CR 608.2d: When set, an opponent chooses whether to perform this optional effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional_for: Option<OpponentMayScope>,
@@ -24642,6 +24658,7 @@ impl ResolvedAbility {
             context: SpellContext::default(),
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
