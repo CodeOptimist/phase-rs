@@ -675,6 +675,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
         waiting_for,
         WaitingFor::MeldPairChoice { .. }
             | WaitingFor::MeldAttackTargetChoice { .. }
+            | WaitingFor::EntryAttackTargetChoice { .. }
             | WaitingFor::ScryChoice { .. }
             | WaitingFor::ArrangePlanarDeckTopChoice { .. }
             | WaitingFor::RedistributeLifeTotals { .. }
@@ -1556,6 +1557,9 @@ pub(super) fn handle_resolution_choice(
             },
             GameAction::ChooseEntryAttackTarget { target },
         ) => {
+            // CR 508.4: the entering creature's controller chooses one of the
+            // engine-issued defending players, planeswalkers, or battles.
+            // `entry_attack_target_defender` applies CR 508.4a if it went stale.
             if !valid_targets.contains(&target) {
                 return Err(EngineError::InvalidAction(
                     "entry attack target is not one of the offered destinations".to_string(),
@@ -1564,6 +1568,35 @@ pub(super) fn handle_resolution_choice(
             state.waiting_for = WaitingFor::Priority { player };
             crate::game::meld::finish_meld_attack_choice(state, context, target, events);
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+        }
+        (
+            WaitingFor::EntryAttackTargetChoice {
+                player,
+                object_id,
+                valid_targets,
+            },
+            GameAction::ChooseEntryAttackTarget { target },
+        ) => {
+            // CR 508.4: the entering creature's controller chooses one of the
+            // engine-issued defending players, planeswalkers, or battles.
+            // `entry_attack_target_defender` applies CR 508.4a if it went stale.
+            if !valid_targets.contains(&target) {
+                return Err(EngineError::InvalidAction(
+                    "entry attack target is not one of the offered destinations".to_string(),
+                ));
+            }
+            state.waiting_for = WaitingFor::Priority { player };
+            if let Some(defending_player) =
+                crate::game::combat::entry_attack_target_defender(state, player, target)
+            {
+                crate::game::combat::enter_attacking_at_target(
+                    state,
+                    object_id,
+                    defending_player,
+                    target,
+                );
+            }
+            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
             WaitingFor::ScryChoice { player, cards },
@@ -2002,6 +2035,7 @@ pub(super) fn handle_resolution_choice(
                         source_id,
                     );
                     req.mods.enter_tapped = enter_tapped;
+                    req.mods.enters_attacking = enters_attacking;
                     match crate::game::zone_pipeline::move_object(state, req, events) {
                         crate::game::zone_pipeline::ZoneMoveResult::Done => {}
                         // CR 303.4f / CR 616.1: the accepted card's battlefield
@@ -2032,19 +2066,6 @@ pub(super) fn handle_resolution_choice(
                                 state.waiting_for.clone(),
                             ));
                         }
-                    }
-                    // CR 508.4: "...tapped and attacking" — place the accepted card
-                    // in combat. `source_id` (the ability source / trigger attacker)
-                    // supplies the defending player, matching the synchronous path.
-                    if enters_attacking {
-                        let controller = state
-                            .objects
-                            .get(&hit_card)
-                            .map(|obj| obj.controller)
-                            .unwrap_or(player);
-                        crate::game::combat::enter_attacking(
-                            state, hit_card, source_id, controller,
-                        );
                     }
                 } else {
                     // CR 614.6: a kept card accepted to a non-battlefield zone
@@ -3337,6 +3358,7 @@ pub(super) fn handle_resolution_choice(
                 rest_destination,
                 rest_order,
                 enter_tapped,
+                enters_attacking,
                 source_id: dig_source_id,
                 ..
             },
@@ -3543,6 +3565,7 @@ pub(super) fn handle_resolution_choice(
                     );
                     req.mods.enter_tapped =
                         crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped);
+                    req.mods.enters_attacking = enters_attacking;
                     match crate::game::zone_pipeline::move_object(state, req, events) {
                         crate::game::zone_pipeline::ZoneMoveResult::Done => {}
                         // CR 303.4f / CR 616.1: the kept card's battlefield
@@ -8031,6 +8054,7 @@ pub(crate) fn run_batch_completion(
             selected,
             destination,
             enter_tapped,
+            enters_attacking,
         } => {
             crate::game::effects::dig::move_mass_put_all_selected(
                 state,
@@ -8039,6 +8063,7 @@ pub(crate) fn run_batch_completion(
                 selected,
                 destination,
                 enter_tapped,
+                enters_attacking,
                 events,
             );
             crate::game::zone_pipeline::BatchMoveResult::Done
@@ -9912,6 +9937,7 @@ mod tests {
                 rest_order: DigRestOrder::Preserve,
                 source_id: None,
                 enter_tapped: false,
+                enters_attacking: false,
             },
             GameAction::SelectCards { cards: vec![white] },
             &mut events,
@@ -9994,6 +10020,7 @@ mod tests {
                 rest_order: DigRestOrder::Random,
                 source_id: None,
                 enter_tapped: false,
+                enters_attacking: false,
             },
             GameAction::SelectCards { cards: vec![keep] },
             &mut events,
@@ -10033,6 +10060,7 @@ mod tests {
                 rest_order: DigRestOrder::Preserve,
                 source_id: None,
                 enter_tapped: false,
+                enters_attacking: false,
             },
             GameAction::SelectCards { cards: vec![keep] },
             &mut events,

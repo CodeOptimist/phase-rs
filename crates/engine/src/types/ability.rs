@@ -11294,6 +11294,10 @@ pub enum Effect {
             skip_serializing_if = "EtbTapState::is_unspecified"
         )]
         enter_tapped: EtbTapState,
+        /// CR 508.4: Creatures enter combat during the mass move without being
+        /// declared as attackers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enters_attacking: bool,
         /// CR 122.1 + CR 122.1h: Counters placed on each object as it enters the
         /// battlefield during the mass move. Each entry is `(counter_type,
         /// count)`. Mirrors `Effect::ChangeZone.enter_with_counters` for the mass
@@ -11368,6 +11372,9 @@ pub enum Effect {
         /// tapped when true (Planar Genesis — "onto the battlefield tapped").
         #[serde(default)]
         enter_tapped: bool,
+        /// CR 508.4: Kept cards routed to the battlefield enter attacking.
+        #[serde(default)]
+        enters_attacking: bool,
         /// Determines where the resolver reads the card set from. See [`DigSource`].
         #[serde(default, skip_serializing_if = "DigSource::is_library")]
         source: DigSource,

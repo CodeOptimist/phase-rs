@@ -4809,6 +4809,8 @@ pub struct PendingBatchZoneMoveRequest {
     pub cause: PendingBatchZoneChangeCause,
     #[serde(default, skip_serializing_if = "EtbTapState::is_unspecified")]
     pub enter_tapped: EtbTapState,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enters_attacking: bool,
     #[serde(default)]
     pub enter_transformed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5085,6 +5087,8 @@ pub enum BatchCompletion {
         selected: Vec<ObjectId>,
         destination: Zone,
         enter_tapped: EtbTapState,
+        #[serde(default)]
+        enters_attacking: bool,
     },
     /// CR 608.2c + CR 616.1: Every selected card of a deterministic mass Dig
     /// has settled. Publish only cards that actually reached `destination`, then
@@ -5502,6 +5506,10 @@ pub enum PendingCounterPostAction {
         source_id: Option<ObjectId>,
         duration: Option<Duration>,
         exile_tracking: ZoneDeliveryExileTracking,
+        /// CR 508.4: The completed battlefield entry joins combat after any
+        /// as-enters replacement choice has settled.
+        #[serde(default)]
+        enters_attacking: bool,
         /// Who drains `post_replacement_continuation` when this deferred tail
         /// finally runs (CR 614.12a). `#[serde(default)]` = `DeliveryTail`,
         /// matching every record minted before the field existed.
@@ -9834,11 +9842,18 @@ pub enum WaitingFor {
         player: PlayerId,
         choices: Vec<MeldSelection>,
     },
-    /// CR 508.4a: choose what the meld result enters attacking. The engine
+    /// CR 508.4: choose what the meld result enters attacking. The engine
     /// supplies the complete legal topology; clients only return one member.
     MeldAttackTargetChoice {
         player: PlayerId,
         context: MeldSelection,
+        valid_targets: Vec<AttackTarget>,
+    },
+    /// CR 508.4: choose a defending player, planeswalker, or battle for a
+    /// creature that entered the battlefield attacking during resolution.
+    EntryAttackTargetChoice {
+        player: PlayerId,
+        object_id: ObjectId,
         valid_targets: Vec<AttackTarget>,
     },
     /// CR 103.5 + 103.5b: London mulligan — each un-kept player decides
@@ -10268,6 +10283,10 @@ pub enum WaitingFor {
         /// dig are tapped.
         #[serde(default)]
         enter_tapped: bool,
+        /// CR 508.4: Kept cards entering the battlefield via this dig enter
+        /// attacking rather than being declared as attackers.
+        #[serde(default)]
+        enters_attacking: bool,
     },
     SurveilChoice {
         player: PlayerId,
@@ -12091,6 +12110,7 @@ impl WaitingFor {
             WaitingFor::Priority { .. } => "Priority",
             WaitingFor::MeldPairChoice { .. } => "MeldPairChoice",
             WaitingFor::MeldAttackTargetChoice { .. } => "MeldAttackTargetChoice",
+            WaitingFor::EntryAttackTargetChoice { .. } => "EntryAttackTargetChoice",
             WaitingFor::MulliganDecision { .. } => "MulliganDecision",
             WaitingFor::OpeningHandBottomCards { .. } => "OpeningHandBottomCards",
             WaitingFor::ManaPayment { .. } => "ManaPayment",
@@ -12244,6 +12264,7 @@ impl WaitingFor {
             WaitingFor::Priority { player }
             | WaitingFor::MeldPairChoice { player, .. }
             | WaitingFor::MeldAttackTargetChoice { player, .. }
+            | WaitingFor::EntryAttackTargetChoice { player, .. }
             | WaitingFor::ManaPayment { player, .. }
             | WaitingFor::ManaSourceSelection { player, .. }
             | WaitingFor::ChooseXValue { player, .. }
@@ -27422,6 +27443,7 @@ mod tests {
             rest_order: crate::types::ability::DigRestOrder::Preserve,
             source_id: None,
             enter_tapped: false,
+            enters_attacking: false,
         }));
         variants.push(Box::new(WaitingFor::SurveilChoice {
             player: PlayerId(0),
