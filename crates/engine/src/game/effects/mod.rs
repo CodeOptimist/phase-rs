@@ -2939,32 +2939,54 @@ fn filter_contains_last_zone_changed(filter: &TargetFilter) -> bool {
     crate::game::filter::filter_contains_last_zone_changed(filter)
 }
 
-fn quantity_expr_depends_on_zone_change_this_way(expr: &QuantityExpr) -> bool {
-    match expr {
-        QuantityExpr::Ref { qty } => quantity_ref_depends_on_zone_change_this_way(qty),
-        QuantityExpr::DivideRounded { inner, .. }
-        | QuantityExpr::Multiply { inner, .. }
-        | QuantityExpr::ClampMin { inner, .. }
-        | QuantityExpr::Offset { inner, .. } => {
-            quantity_expr_depends_on_zone_change_this_way(inner)
-        }
-        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
-            .iter()
-            .any(quantity_expr_depends_on_zone_change_this_way),
-        QuantityExpr::UpTo { max } => quantity_expr_depends_on_zone_change_this_way(max),
-        QuantityExpr::Power { exponent, .. } => {
-            quantity_expr_depends_on_zone_change_this_way(exponent)
-        }
-        QuantityExpr::Difference { left, right } => {
-            quantity_expr_depends_on_zone_change_this_way(left)
-                || quantity_expr_depends_on_zone_change_this_way(right)
-        }
-        QuantityExpr::Fixed { .. } => false,
+fn filter_contains_last_created(filter: &TargetFilter) -> bool {
+    crate::game::filter::filter_contains_last_created(filter)
+}
+
+/// Whether the object population a `CardTypeSetSource` reads is selected by a
+/// filter satisfying `filter_pred`.
+///
+/// Exhaustive: the three non-`Objects` sources name a zone, the source's exile
+/// set, or a tracked set, none of which carries a `TargetFilter`.
+fn card_type_set_source_counts_population_matching(
+    source: &crate::types::ability::CardTypeSetSource,
+    filter_pred: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::CardTypeSetSource;
+    match source {
+        CardTypeSetSource::Objects { filter } => filter_pred(filter),
+        CardTypeSetSource::Zone { .. }
+        | CardTypeSetSource::ExiledBySource
+        | CardTypeSetSource::TrackedSet { .. } => false,
     }
 }
 
-fn quantity_ref_depends_on_zone_change_this_way(qty: &QuantityRef) -> bool {
+/// Whether the population `qty` counts over is selected by a `TargetFilter`
+/// satisfying `filter_pred`.
+///
+/// Single enumeration of the "this ref reads a population" variant set, shared
+/// by every predicate that asks whether a magnitude depends on a particular
+/// resolution-local anaphor ledger (`LastZoneChanged`, `LastCreated`, …).
+/// Without it each such predicate re-listed the same variants and a new
+/// population-counting `QuantityRef` had to be threaded once per predicate.
+///
+/// EXHAUSTIVE, no `_` arm. The wildcard this replaced classified every unlisted
+/// variant as filter-free, which was wrong for thirteen variants that already
+/// carried one (`SacrificedThisTurn`, `ZoneChangeCountThisTurn`,
+/// `DamageDealtThisTurn`, `TokensCreatedThisTurn`, …) and would have been wrong
+/// by default for every future one. A new `QuantityRef` now has to be classified
+/// here before it compiles, which is the point: "does this magnitude read a
+/// population?" is a decision, not a default.
+///
+/// Returning a predicate rather than an `Option<&TargetFilter>` is what lets
+/// `DamageDealtThisTurn` report BOTH of its filters; a single-filter accessor
+/// structurally could not.
+fn quantity_ref_counts_population_matching(
+    qty: &QuantityRef,
+    filter_pred: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
     match qty {
+        // Owned `TargetFilter` naming the counted population.
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
@@ -2974,18 +2996,113 @@ fn quantity_ref_depends_on_zone_change_this_way(qty: &QuantityRef) -> bool {
         | QuantityRef::DistinctColorsAmongPermanents { filter }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
-        | QuantityRef::BattlefieldEntriesThisTurn { filter, .. } => {
-            filter_contains_last_zone_changed(filter)
+        | QuantityRef::SacrificedThisTurn { filter, .. }
+        | QuantityRef::BattlefieldEntriesThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeCountThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeAggregateThisTurn { filter, .. }
+        | QuantityRef::TokensCreatedThisTurn { filter, .. } => filter_pred(filter),
+        // Same, under a field named for what it selects rather than `filter`.
+        QuantityRef::CounterAddedThisTurn { target, .. } => filter_pred(target),
+        // Boxed.
+        QuantityRef::TargetObjectManaValue { filter }
+        | QuantityRef::FilteredTrackedSetSize { filter, .. } => filter_pred(filter),
+        // Optional narrowing on an otherwise unfiltered count.
+        QuantityRef::ZoneCardCount { filter, .. }
+        | QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
+        | QuantityRef::AttackedThisTurn { filter, .. }
+        | QuantityRef::SpellsCastThisGame { filter, .. } => {
+            filter.as_ref().is_some_and(filter_pred)
         }
-        QuantityRef::DistinctCardTypes {
-            source: crate::types::ability::CardTypeSetSource::Objects { filter },
+        // CR 120.1 + CR 120.2: two independent populations — what dealt the damage
+        // and what received it. Either one can carry the anaphor.
+        QuantityRef::DamageDealtThisTurn { source, target, .. } => {
+            filter_pred(source) || filter_pred(target)
         }
-        | QuantityRef::DistinctSubtypes {
-            source: crate::types::ability::CardTypeSetSource::Objects { filter },
-            ..
-        } => filter_contains_last_zone_changed(filter),
-        _ => false,
+        QuantityRef::DistinctCardTypes { source }
+        | QuantityRef::DistinctSubtypes { source, .. } => {
+            card_type_set_source_counts_population_matching(source, filter_pred)
+        }
+        // No `TargetFilter` anywhere: player-scoped totals, per-object scopes,
+        // resolution/turn counters, and cost bookkeeping.
+        QuantityRef::HandSize { .. }
+        | QuantityRef::LifeTotal { .. }
+        | QuantityRef::GraveyardSize { .. }
+        | QuantityRef::LifeAboveStarting
+        | QuantityRef::StartingLifeTotal
+        | QuantityRef::TriggeringDiscoverValue
+        | QuantityRef::TriggeringScryLookCount
+        | QuantityRef::TriggeringScryBottomCount
+        | QuantityRef::PlayerCount { .. }
+        | QuantityRef::CountersOn { .. }
+        | QuantityRef::PlayerCounter { .. }
+        | QuantityRef::TargetControllerCounter { .. }
+        | QuantityRef::Variable { .. }
+        | QuantityRef::Power { .. }
+        | QuantityRef::Intensity { .. }
+        | QuantityRef::Toughness { .. }
+        | QuantityRef::ObjectManaValue { .. }
+        | QuantityRef::ObjectColorCount { .. }
+        | QuantityRef::ObjectNameWordCount { .. }
+        | QuantityRef::ObjectTypelineComponentCount { .. }
+        | QuantityRef::ManaSymbolsInManaCost { .. }
+        | QuantityRef::SelfManaValue
+        | QuantityRef::TargetZoneCardCount { .. }
+        | QuantityRef::Devotion { .. }
+        | QuantityRef::CardsExiledBySource
+        | QuantityRef::ExiledCardPower { .. }
+        | QuantityRef::BasicLandTypeCount { .. }
+        | QuantityRef::TrackedSetSize
+        | QuantityRef::TrackedSetAggregate { .. }
+        | QuantityRef::ExiledFromHandThisResolution
+        | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::LifeLostThisTurn { .. }
+        | QuantityRef::PartySize { .. }
+        | QuantityRef::UnspentMana { .. }
+        | QuantityRef::Speed { .. }
+        | QuantityRef::EventContextAmount
+        | QuantityRef::EventContextPlayerCount { .. }
+        | QuantityRef::AttachmentsOnLeavingObject { .. }
+        | QuantityRef::EventContextSourceCostX
+        | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::BendTypesThisTurn
+        | QuantityRef::LifeGainedThisTurn { .. }
+        | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::LandsPlayedThisTurn { .. }
+        | QuantityRef::TurnsTaken
+        | QuantityRef::ChosenNumber
+        | QuantityRef::DescendedThisTurn
+        | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+        | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::CardsDiscardedThisTurn { .. }
+        | QuantityRef::PlayerActionsThisTurn { .. }
+        | QuantityRef::DungeonsCompleted
+        | QuantityRef::CostXPaid
+        | QuantityRef::KickerCount
+        | QuantityRef::AdditionalCostPaymentCount
+        | QuantityRef::AdditionalCostPaymentCountFor { .. }
+        | QuantityRef::ConvokedCreatureCount
+        | QuantityRef::TimesCostPaidThisResolution
+        | QuantityRef::ManaSpentToCast { .. }
+        | QuantityRef::ColorsInCommandersColorIdentity
+        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderManaValue { .. }
+        | QuantityRef::VoteCount { .. } => false,
     }
+}
+
+/// Whether any magnitude in `expr` counts a population selected by a filter
+/// satisfying `filter_pred`. Traversal delegates to `QuantityExpr::any_ref`
+/// (the single composition-form authority) and the variant set to
+/// [`quantity_ref_counts_population_matching`].
+fn quantity_expr_counts_population_matching(
+    expr: &QuantityExpr,
+    filter_pred: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    quantity_expr_any_ref(expr, &mut |qty| {
+        quantity_ref_counts_population_matching(qty, filter_pred)
+    })
 }
 
 fn condition_depends_on_zone_change_this_way(condition: &AbilityCondition) -> bool {
@@ -2993,14 +3110,139 @@ fn condition_depends_on_zone_change_this_way(condition: &AbilityCondition) -> bo
         AbilityCondition::ZoneChangedThisWay { .. }
         | AbilityCondition::DiscardedCardMatchesFilter { .. } => true,
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
-            quantity_expr_depends_on_zone_change_this_way(lhs)
-                || quantity_expr_depends_on_zone_change_this_way(rhs)
+            quantity_expr_counts_population_matching(lhs, &filter_contains_last_zone_changed)
+                || quantity_expr_counts_population_matching(rhs, &filter_contains_last_zone_changed)
         }
         AbilityCondition::Not { condition } => condition_depends_on_zone_change_this_way(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
             .iter()
             .any(condition_depends_on_zone_change_this_way),
         _ => false,
+    }
+}
+
+/// CR 608.2c + CR 111.1: Whether a condition reads the resolution-local
+/// `last_created_token_ids` ledger — the "the token created this way" / "it"
+/// anaphor a token-creating instruction publishes when it COMPLETES
+/// (`record_last_created_token`, the tail of the liminal entry finalization).
+///
+/// Structural twin of [`condition_depends_on_zone_change_this_way`], and used at
+/// the same gate for the same reason: while the parent instruction is suspended
+/// on a player choice mid-entry (a CR 616.1 replacement ordering prompt, or the
+/// CR 303.4f Aura-host prompt raised when a token copy of an Aura enters), the
+/// ledger does not yet name the token being created. Evaluating "If the token is
+/// an Aura, …" against it there reads a stale population and silently drops the
+/// gated sub-ability (Yenna, Redtooth Regent). Deferring the sub WITH its
+/// condition re-evaluates it at chain top once the entry completes, which is
+/// also the CR 608.2c order: the gated sentence is the NEXT instruction and
+/// cannot begin before this one finishes.
+///
+/// Predicate helper, not rule-implementing code — the CR annotation lives at the
+/// gate.
+fn condition_depends_on_last_created(condition: &AbilityCondition) -> bool {
+    condition_reads_filter_population(condition, &filter_contains_last_created)
+}
+
+/// Whether any filter or counted population anywhere inside `condition`
+/// satisfies `leaf`.
+///
+/// EXHAUSTIVE on `AbilityCondition`, no `_` arm, for the same reason
+/// `filter::filter_contains` is exhaustive on `TargetFilter`. The wildcard this
+/// replaced classified EVERY filter-bearing condition as anaphor-free:
+/// `TargetMatchesFilter`, `ControllerControlsMatching`, `SourceMatchesFilter`,
+/// `ZoneChangeObjectMatchesFilter` and `DiscardedCardMatchesFilter` all read as
+/// mentioning nothing, so a sub-ability gated on "if the token is an Aura" was
+/// not deferred and evaluated against a ledger the suspended parent had not
+/// published yet — the exact CR 608.2c defect this predicate family exists to
+/// prevent.
+///
+/// Both carriers of a filter are covered: a `TargetFilter` mentioned directly
+/// (via `filter_contains`, which also descends `FilterProp` and `PlayerFilter`),
+/// and a population COUNTED by a `QuantityExpr` (via
+/// `quantity_expr_counts_population_matching`).
+fn condition_reads_filter_population(
+    condition: &AbilityCondition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    let has_filter = |filter: &TargetFilter| crate::game::filter::filter_contains(filter, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let recurse = |inner: &AbilityCondition| condition_reads_filter_population(inner, leaf);
+    match condition {
+        // Compound / wrapping conditions.
+        AbilityCondition::Not { condition } => recurse(condition),
+        AbilityCondition::ConditionInstead { inner } => recurse(inner),
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(recurse)
+        }
+        // Conditions that name a population by filter.
+        AbilityCondition::ObjectsShareQuality {
+            subject, reference, ..
+        } => has_filter(subject) || has_filter(reference),
+        AbilityCondition::TargetSharesNameWithOtherExiledThisWay { target } => has_filter(target),
+        AbilityCondition::DiscardedCardMatchesFilter { filter }
+        | AbilityCondition::TargetMatchesFilter { filter, .. }
+        | AbilityCondition::TriggeringSpellTargetsFilter { filter }
+        | AbilityCondition::SourceMatchesFilter { filter }
+        | AbilityCondition::PostReplacementDamageSourceMatchesFilter { filter }
+        | AbilityCondition::ZoneChangeObjectMatchesFilter { filter, .. }
+        | AbilityCondition::ControllerControlsMatching { filter }
+        | AbilityCondition::ControllerControlledMatchingAsCast { filter }
+        | AbilityCondition::ZoneChangedThisWay { filter }
+        | AbilityCondition::CostPaidObjectMatchesFilter { filter } => has_filter(filter),
+        AbilityCondition::RevealedHasCardType {
+            additional_filter,
+            subtype_filter,
+            ..
+        } => {
+            subtype_filter.as_deref().is_some_and(has_filter)
+                || additional_filter
+                    .as_ref()
+                    .is_some_and(|prop| crate::game::filter::filter_prop_contains(prop, leaf))
+        }
+        AbilityCondition::ScopedPlayerMatches { filter } => {
+            crate::game::filter::player_filter_contains(filter, leaf)
+        }
+        // Conditions that COUNT a population.
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => has_quantity(lhs) || has_quantity(rhs),
+        AbilityCondition::PreviousEffectAmount { rhs, .. } => has_quantity(rhs),
+        // Leaves: nothing filter- or quantity-shaped to read.
+        AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+        | AbilityCondition::AdditionalCostPaid { .. }
+        | AbilityCondition::AdditionalCostPaidInstead
+        | AbilityCondition::AlternativeManaCostPaid
+        | AbilityCondition::EffectOutcome { .. }
+        | AbilityCondition::EventOutcomeWon
+        | AbilityCondition::CoinFlipOutcome { .. }
+        | AbilityCondition::WhenYouDo
+        | AbilityCondition::WasCast { .. }
+        | AbilityCondition::CastDuringPhase { .. }
+        | AbilityCondition::CurrentPhaseIs { .. }
+        | AbilityCondition::CastTimingPermission { .. }
+        | AbilityCondition::ManaColorSpent { .. }
+        | AbilityCondition::SourceEnteredThisTurn
+        | AbilityCondition::CastVariantPaid { .. }
+        | AbilityCondition::CastVariantPaidInstead { .. }
+        | AbilityCondition::HasMaxSpeed
+        | AbilityCondition::IsMonarch
+        | AbilityCondition::IsInitiative
+        | AbilityCondition::HasCityBlessing
+        | AbilityCondition::HasEnduringStory
+        | AbilityCondition::IsRingBearer
+        | AbilityCondition::CompletedDungeon { .. }
+        | AbilityCondition::TargetHasKeywordInstead { .. }
+        | AbilityCondition::HasObjectTarget
+        | AbilityCondition::IsYourTurn
+        | AbilityCondition::WasStartingPlayer { .. }
+        | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+        | AbilityCondition::FirstCombatPhaseOfTurn
+        | AbilityCondition::FirstEndStepOfTurn
+        | AbilityCondition::SourceIsTapped
+        | AbilityCondition::SourceAttachedToCreature
+        | AbilityCondition::DayNightIsNeither
+        | AbilityCondition::DayNightIs { .. }
+        | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::SourceLacksKeyword { .. } => false,
     }
 }
 
@@ -10929,9 +11171,22 @@ fn resolve_chain_body(
             // resolution choice would mis-defer e.g. a `Sacrifice`→`EffectZoneChoice`
             // →`TargetMatchesFilter`-gated sibling, whose completion leaves
             // `cont.chain.targets` empty (it uses the tracked-set/ParentTarget path).
+            // CR 608.2c + CR 111.1 + CR 303.4f: The `last_created_token_ids`
+            // twin of the `last_zone_changed_ids` deferral above. A token entry
+            // publishes "the token created this way" only when the entry
+            // FINISHES; while it is suspended mid-entry — on a CR 616.1
+            // replacement-ordering prompt, or on the CR 303.4f host prompt a
+            // token copy of an Aura raises — the ledger still names the previous
+            // instruction's tokens (or nothing at all). Evaluating a gate like
+            // Yenna, Redtooth Regent's "If the token is an Aura, untap Yenna,
+            // then scry 2" there reads that stale population, so the whole
+            // trailing sentence was silently dropped. Defer it WITH its
+            // condition; the drain re-evaluates it at chain top after the entry
+            // completes, which is the order CR 608.2c requires anyway.
             if waits_for_resolution_choice(&state.waiting_for)
                 && (condition_depends_on_effect_performed(condition)
                     || condition_depends_on_zone_change_this_way(condition)
+                    || condition_depends_on_last_created(condition)
                     || matches!(condition, AbilityCondition::WhenYouDo)
                     || (matches!(state.waiting_for, WaitingFor::SearchChoice { .. })
                         && condition_depends_on_result_object(condition))
@@ -29472,5 +29727,185 @@ mod tests {
             "CR 122.1: only 2 counters existed, so the re-anchoring consumer must \
              read the 2 actually removed — not the 7 the relay asked for"
         );
+    }
+    /// CR 608.2c: the deferral gate asks whether a gated sub-ability's CONDITION
+    /// reads a resolution-local anaphor ledger. That question is answered by
+    /// walking every `TargetFilter` a `QuantityRef` counts over — and the
+    /// wildcard this replaced answered "no filter" for thirteen variants that
+    /// already carried one, so a magnitude like "damage dealt this turn by the
+    /// token created this way" silently read as anaphor-free and the trailing
+    /// sentence evaluated against a stale ledger mid-prompt.
+    ///
+    /// One representative per shape the exhaustive match had to classify: a
+    /// two-filter variant, an optional filter, a boxed filter, and a differently
+    /// named field.
+    #[test]
+    fn population_predicate_sees_filters_the_wildcard_arm_used_to_swallow() {
+        let counts = |qty: QuantityRef| {
+            condition_depends_on_last_created(&AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref { qty },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            })
+        };
+        let anaphor = || TargetFilter::LastCreated;
+        let plain = || TargetFilter::Typed(TypedFilter::creature());
+
+        // Two independent populations: either side carries the anaphor.
+        assert!(counts(QuantityRef::DamageDealtThisTurn {
+            source: Box::new(anaphor()),
+            target: Box::new(plain()),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: Default::default(),
+            channel: DamageChannel::Total,
+        }));
+        assert!(counts(QuantityRef::DamageDealtThisTurn {
+            source: Box::new(plain()),
+            target: Box::new(anaphor()),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: Default::default(),
+            channel: DamageChannel::Total,
+        }));
+        // Optional narrowing filter.
+        assert!(counts(QuantityRef::SpellsCastThisTurn {
+            scope: crate::types::ability::CountScope::Controller,
+            filter: Some(anaphor()),
+        }));
+        // Boxed filter.
+        assert!(counts(QuantityRef::TargetObjectManaValue {
+            filter: Box::new(anaphor()),
+        }));
+        // Field named for what it selects rather than `filter`.
+        assert!(counts(QuantityRef::CounterAddedThisTurn {
+            actor: crate::types::ability::CountScope::Controller,
+            counters: CounterMatch::Any,
+            target: anaphor(),
+        }));
+        // Nested one level down through a compound, and through the
+        // `ChosenDamageSource` inner filter the traversal used to skip.
+        assert!(counts(QuantityRef::TokensCreatedThisTurn {
+            player: PlayerScope::Controller,
+            filter: TargetFilter::ChosenDamageSource {
+                filter: Some(Box::new(anaphor())),
+            },
+        }));
+
+        // Negatives: the same variants without the anaphor, and a genuinely
+        // filter-free ref.
+        assert!(!counts(QuantityRef::SpellsCastThisTurn {
+            scope: crate::types::ability::CountScope::Controller,
+            filter: Some(plain()),
+        }));
+        assert!(!counts(QuantityRef::SpellsCastThisTurn {
+            scope: crate::types::ability::CountScope::Controller,
+            filter: None,
+        }));
+        assert!(!counts(QuantityRef::HandSize {
+            player: PlayerScope::Controller,
+        }));
+    }
+
+    /// CR 608.2c + CR 111.1: every FILTER-bearing `AbilityCondition` must be
+    /// classified, not just the counting one.
+    ///
+    /// The `_ => false` this replaced read every one of these as anaphor-free, so
+    /// a sub-ability gated on "the token created this way" was evaluated against a
+    /// ledger the suspended parent had not published yet and silently dropped —
+    /// the defect this whole predicate family exists to prevent. Each assertion
+    /// below flips to `false` if its arm is removed from
+    /// `condition_reads_filter_population`.
+    #[test]
+    fn every_filter_bearing_condition_sees_the_last_created_anaphor() {
+        let anaphor = || TargetFilter::LastCreated;
+        let cases: Vec<AbilityCondition> = vec![
+            AbilityCondition::TargetMatchesFilter {
+                filter: anaphor(),
+                use_lki: false,
+                subject_slot: None,
+            },
+            AbilityCondition::ControllerControlsMatching { filter: anaphor() },
+            AbilityCondition::SourceMatchesFilter { filter: anaphor() },
+            AbilityCondition::ZoneChangeObjectMatchesFilter {
+                origin: None,
+                destination: Zone::Battlefield,
+                filter: anaphor(),
+            },
+            AbilityCondition::DiscardedCardMatchesFilter { filter: anaphor() },
+            AbilityCondition::CostPaidObjectMatchesFilter { filter: anaphor() },
+            AbilityCondition::TriggeringSpellTargetsFilter { filter: anaphor() },
+            AbilityCondition::ControllerControlledMatchingAsCast { filter: anaphor() },
+            AbilityCondition::ZoneChangedThisWay { filter: anaphor() },
+            AbilityCondition::PostReplacementDamageSourceMatchesFilter { filter: anaphor() },
+            AbilityCondition::TargetSharesNameWithOtherExiledThisWay { target: anaphor() },
+            AbilityCondition::ObjectsShareQuality {
+                subject: anaphor(),
+                reference: TargetFilter::Any,
+                quality: crate::types::ability::SharedQuality::Color,
+            },
+            AbilityCondition::ScopedPlayerMatches {
+                filter: PlayerFilter::ControlsCount {
+                    relation: crate::types::ability::PlayerRelation::Controller,
+                    filter: anaphor(),
+                    comparator: Comparator::GE,
+                    count: Box::new(QuantityExpr::Fixed { value: 1 }),
+                },
+            },
+        ];
+        for condition in cases {
+            assert!(
+                condition_depends_on_last_created(&condition),
+                "CR 608.2c: {condition:?} names the last-created population"
+            );
+        }
+    }
+
+    /// The same predicate must still say NO to a condition that mentions no
+    /// anaphor, or the deferral gate would defer every gated sub-ability.
+    #[test]
+    fn a_condition_without_the_anaphor_is_not_deferred() {
+        assert!(!condition_depends_on_last_created(
+            &AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::Typed(TypedFilter::creature()),
+                use_lki: false,
+                subject_slot: None,
+            }
+        ));
+        assert!(!condition_depends_on_last_created(
+            &AbilityCondition::IsMonarch
+        ));
+        assert!(!condition_depends_on_last_created(
+            &AbilityCondition::ZoneChangedThisWay {
+                filter: TargetFilter::LastZoneChanged,
+            }
+        ));
+    }
+
+    /// Compound and prop-nested carriers reach the anaphor too: `Not`/`And`/`Or`,
+    /// `ConditionInstead`, and a filter buried inside a `Typed` filter's
+    /// properties — the `TargetFilter::Typed(_)` leaf arm this pass removed.
+    #[test]
+    fn nested_carriers_still_reach_the_last_created_anaphor() {
+        let nested_in_props = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::DistinctFrom {
+                reference: Box::new(TargetFilter::LastCreated),
+            },
+        ]));
+        let leaf = AbilityCondition::SourceMatchesFilter {
+            filter: nested_in_props,
+        };
+        assert!(condition_depends_on_last_created(&leaf));
+        assert!(condition_depends_on_last_created(&AbilityCondition::Not {
+            condition: Box::new(leaf.clone()),
+        }));
+        assert!(condition_depends_on_last_created(&AbilityCondition::And {
+            conditions: vec![AbilityCondition::IsMonarch, leaf.clone()],
+        }));
+        assert!(condition_depends_on_last_created(
+            &AbilityCondition::ConditionInstead {
+                inner: Box::new(leaf),
+            }
+        ));
     }
 }
