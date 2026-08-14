@@ -2219,6 +2219,9 @@ fn legacy_controller_ref(x: &ControllerRef) -> bool {
         // CR 102.1: the active player is a game-defined role read live, not a
         // frozen event-context tag.
         | ControllerRef::ActivePlayer
+        // CR 109.4 + CR 611.2: a frozen player id is a plain literal read, not
+        // an event-context tag.
+        | ControllerRef::SpecificPlayer { .. }
         | ControllerRef::EnchantedPlayer => false,
     }
 }
@@ -2570,6 +2573,9 @@ fn member_bound_controller_ref(x: &ControllerRef) -> bool {
         // CR 102.1: the active player is a game-defined role read live from
         // `state.active_player`, not per-source member-bound storage.
         | ControllerRef::ActivePlayer
+        // CR 109.4 + CR 611.2: a frozen player id is a plain literal read, not
+        // an event-context tag.
+        | ControllerRef::SpecificPlayer { .. }
         | ControllerRef::DefendingPlayer => false,
     }
 }
@@ -3261,11 +3267,14 @@ fn legacy_effect(x: &Effect) -> bool {
         }
         Effect::ForceAttack {
             target,
-            required_player,
+            required_defender,
             duration,
+            // A static single-vs-mass discriminant (CR 115.1), never a legacy
+            // target/duration seam of its own.
+            scope: _,
         } => {
             legacy_target_filter(target)
-                || legacy_target_filter(required_player)
+                || legacy_target_filter(required_defender)
                 || legacy_duration(duration)
         }
 
@@ -5479,8 +5488,11 @@ fn rw_effect(
         | Effect::SolveCase => (ext_write(StateKind::Other), None),
         Effect::ForceAttack {
             target,
-            required_player: _,
+            required_defender: _,
             duration,
+            // A static single-vs-mass discriminant (CR 115.1): reads nothing and
+            // writes nothing, so it contributes no read/write profile.
+            scope: _,
         } => {
             let mut p = ext_write(StateKind::Other);
             flag_legacy_write_target(&mut p, target);
@@ -6620,6 +6632,9 @@ fn rw_player_scope(x: &PlayerScope) -> RwProfile {
         | PlayerScope::Opponent { .. }
         | PlayerScope::RecipientController
         | PlayerScope::AnyTurn
+        // CR 611.2 + CR 514.2: duration-timing-only, like `AnyTurn` — never reached
+        // from a value/quantity/player-selection position.
+        | PlayerScope::SpecificPlayer { .. }
         | PlayerScope::DefendingPlayer => RwProfile::empty(),
     }
 }
@@ -6645,6 +6660,9 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
         // CR 102.1: a live read of `state.active_player` — no sibling-mutable
         // state, empty RW profile (mirrors `DefendingPlayer`).
         | ControllerRef::ActivePlayer
+        // CR 109.4 + CR 611.2: a frozen player id is a plain literal read, not
+        // an event-context tag.
+        | ControllerRef::SpecificPlayer { .. }
         // resolution-local (ResolvedAbility.chosen_players)
         | ControllerRef::ChosenPlayer { .. } => RwProfile::empty(),
     }

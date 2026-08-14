@@ -4717,6 +4717,9 @@ fn resolve_ref(
                         }
                         // CR 102.1: attachment controlled by the active player.
                         Some(ControllerRef::ActivePlayer) => snap.controller == state.active_player,
+                        // CR 109.4 + CR 611.2: a resolution-time snapshot player id — concrete with
+                        // no ability/event context needed, unlike the fail-closed siblings above.
+                        Some(ControllerRef::SpecificPlayer { id }) => snap.controller == *id,
                     })
                     .count(),
             )
@@ -4783,6 +4786,9 @@ fn damage_source_controller_matches(
         }
         // CR 102.1: damage source controlled by the active player (read live).
         ControllerRef::ActivePlayer => actual == state.active_player,
+        // CR 109.4 + CR 611.2: a resolution-time snapshot player id — concrete with
+        // no ability/event context needed, unlike the fail-closed siblings above.
+        ControllerRef::SpecificPlayer { id } => actual == *id,
     }
 }
 
@@ -6325,6 +6331,11 @@ fn resolve_single_player_scope(
                 "PlayerScope::AnyTurn is duration-timing-only; never reached via QuantityRef"
             )
         }
+        PlayerScope::SpecificPlayer { .. } => {
+            unreachable!(
+                "PlayerScope::SpecificPlayer is duration-timing-only; never reached via QuantityRef"
+            )
+        }
     }
 }
 
@@ -6421,6 +6432,11 @@ where
         PlayerScope::AnyTurn => {
             unreachable!(
                 "PlayerScope::AnyTurn is duration-timing-only; never reached via QuantityRef"
+            )
+        }
+        PlayerScope::SpecificPlayer { .. } => {
+            unreachable!(
+                "PlayerScope::SpecificPlayer is duration-timing-only; never reached via QuantityRef"
             )
         }
     }
