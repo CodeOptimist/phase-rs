@@ -4931,7 +4931,8 @@ fn scan_keyword(kw: &Keyword, mode: ScanMode) -> Axes {
         | Keyword::Echo(_)
         | Keyword::Buyback(_)
         | Keyword::Cycling(_)
-        | Keyword::Flashback(_) => Axes::CONSERVATIVE,
+        | Keyword::Flashback(_)
+        | Keyword::Emerge(_) => Axes::CONSERVATIVE,
         // Every other keyword carries a read-free payload (unit / u32 / String /
         // ManaCost / value tag): it reads nothing on any axis here. Its cost-read,
         // if any, is already captured by `cost_read` above.
@@ -5017,7 +5018,6 @@ fn scan_keyword(kw: &Keyword, mode: ScanMode) -> Axes {
         | Keyword::Madness(_)
         | Keyword::Miracle(_)
         | Keyword::Dash(_)
-        | Keyword::Emerge(_)
         | Keyword::Harmonize(_)
         | Keyword::Foretell(_)
         | Keyword::Mutate(_)
