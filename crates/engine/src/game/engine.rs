@@ -18423,36 +18423,13 @@ mod stage2_injector_tests {
                 // added to `compute_options`' sibling classifier in this file,
                 // which sits above all three producers. Nothing added raises a
                 // `WaitingFor`; the census set is still exactly 5.
-                // THIRD merge with main (this branch × `origin/main` @ 59f5a51e, which
-                // by now carries Wheel of Misfortune's unbounded-number round). Same rule
-                // as the two merges logged above, applied a third time: each side's pins
-                // were local-correct and BOTH are wrong for the merged tree, so the merged
-                // file was re-measured rather than either side taken. `origin/main`
-                // carried `:6656/:6733/:9974`; this branch carried `:6722/:6799/:10001`;
-                // the merged file measures `:6738/:6815/:10053`.
-                //
-                // The merged coordinates are PREDICTED, not merely observed, and the
-                // prediction is what makes this a measurement rather than a fixup:
-                // `main`'s pins plus this branch's own base-relative offsets — `+82/+82/+79`,
-                // the figure the row immediately above derives from base `8035813e6` and
-                // re-derives twice — give `6656+82`/`6733+82`/`9974+79` =
-                // `:6738`/`:6815`/`:10053`, equal to the observed coordinates exactly.
-                // That the branch's offsets compose additively onto main's is the evidence
-                // the merge introduced no new producer and displaced none: a merge that had
-                // gained or lost one would break the additivity, not just shift a pin.
-                //
-                // Set preservation: the assembled needle finds exactly five hits in the
-                // merged effects/mod.rs (`:6738`, `:6815`, `:10053`, `:14805`, `:15290`);
-                // the last two fall inside the `#[cfg(test)]` span opening at `:13563` and
-                // so are the partition's test half, leaving the same three production
-                // producers this row has always pinned. Total still 37, partition still
-                // 5/7/25. The merge added no `WaitingFor` producer on either side — main's
-                // contribution here is the unbounded-range arm in `compute_options`' sibling
-                // classifier and this branch's is the CR 603.4 delayed-hoist carve-out, both
-                // pure classification code.
-                "game/effects/mod.rs:6738".to_string(),
-                "game/effects/mod.rs:6815".to_string(),
-                "game/effects/mod.rs:10053".to_string(),
+                // Current-main port: #7403/#7389 move main's three production pins to
+                // `:6738/:6815/:10053`; the Doomsday tracked-set publication adds seven
+                // lines above each. Re-measured in this merged tree: `:6745/:6822/:10060`.
+                // The three sites remain the existing `OptionalEffectChoice` producers.
+                "game/effects/mod.rs:6745".to_string(),
+                "game/effects/mod.rs:6822".to_string(),
+                "game/effects/mod.rs:10060".to_string(),
                 // UNMOVED across the rebase, and that is itself evidence the SET did not
                 // move: a census that had gained or lost a producer would not leave this
                 // entry both byte-identical AND at the same coordinate.
