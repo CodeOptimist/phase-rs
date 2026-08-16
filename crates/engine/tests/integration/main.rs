@@ -938,6 +938,7 @@ mod relic_of_progenitus_6446;
 mod render_silent_cant_cast;
 mod replacement_mill_double_application;
 mod repro_pilot_crew;
+mod resolve_all_consent;
 mod retarget_prompt_softlock;
 mod revealed_card_type_disjunction_518;
 mod rhys_evermore_remove_counters;
