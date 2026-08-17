@@ -76,7 +76,8 @@ use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 use super::zones;
 
 pub use super::engine_resolve_batch::{
-    resolve_all_fast_forward, ResolveAllCallbackDecision, ResolveAllFastForwardResult,
+    resolve_all_fast_forward, resolve_all_ready_is_authorized, resolve_all_ready_prefix,
+    ResolveAllCallbackDecision, ResolveAllFastForwardResult,
 };
 
 #[derive(Debug, Clone, Error)]
@@ -7612,6 +7613,9 @@ fn begin_resolve_all_consent(
         EngineError::ActionNotAllowed("Resolve All consent epoch space exhausted".to_string())
     })?;
     state.next_resolve_all_consent_epoch = next_epoch;
+    // CR 117.4: a stack object resolves only after every player passes in
+    // succession. Preserve the exact current pass cycle if consent is declined
+    // or revoked before its authorized one-entry materialization begins.
     state.resolve_all_consent_run = Some(ResolveAllConsentRun {
         epoch,
         max_resolutions,
@@ -7689,26 +7693,34 @@ fn respond_resolve_all_consent(
                 "Resolve All consent response is no longer pending".to_string(),
             ));
         }
-        match decision {
-            ResolveAllConsentDecision::Grant => {
-                let participant = run
-                    .participants
-                    .iter_mut()
-                    .find(|participant| participant.representative == representative)
-                    .expect("pending Resolve All representative must be a participant");
-                participant.granted = true;
-            }
-            ResolveAllConsentDecision::Decline => {}
+        if matches!(decision, ResolveAllConsentDecision::Grant) {
+            let participant = run
+                .participants
+                .iter_mut()
+                .find(|participant| participant.representative == representative)
+                .expect("pending Resolve All representative must be a participant");
+            participant.granted = true;
         }
     }
-    match decision {
-        ResolveAllConsentDecision::Decline => restore_resolve_all_priority_snapshot(state),
-        ResolveAllConsentDecision::Grant => {
-            resolve_all_consent_waiting_for(state).ok_or_else(|| {
-                EngineError::InvalidAction("Resolve All consent is not active".to_string())
-            })
-        }
+    if matches!(decision, ResolveAllConsentDecision::Decline) {
+        return restore_resolve_all_priority_snapshot(state);
     }
+    let waiting_for = resolve_all_consent_waiting_for(state).ok_or_else(|| {
+        EngineError::InvalidAction("Resolve All consent is not active".to_string())
+    })?;
+    // ResolveAllReady has no current actor, so the ordinary waiting-state sync
+    // deliberately leaves `priority_player` alone. Restore the saved priority
+    // cursor now; the Ready consumer validates this exact snapshot before it
+    // begins its first materialized CR 117.4 pass cycle.
+    if matches!(waiting_for, WaitingFor::ResolveAllReady { .. }) {
+        state.priority_player = state
+            .resolve_all_consent_run
+            .as_ref()
+            .expect("an active consent run produced ResolveAllReady")
+            .priority_snapshot
+            .priority_player;
+    }
+    Ok(waiting_for)
 }
 
 fn revoke_resolve_all_consent(
@@ -8089,7 +8101,11 @@ fn apply_action(
     let stack_len_before_action = state.stack.len();
     if !matches!(
         action,
-        GameAction::PassPriority | GameAction::OrderTriggers { .. }
+        GameAction::PassPriority
+            | GameAction::OrderTriggers { .. }
+            | GameAction::BeginResolveAll { .. }
+            | GameAction::RespondResolveAllConsent { .. }
+            | GameAction::RevokeResolveAllConsent { .. }
     ) && !answering_forced_window
     {
         state.loop_detect_ring.clear();
@@ -8110,7 +8126,10 @@ fn apply_action(
     match &action {
         GameAction::SetAutoPass { .. }
         | GameAction::PassPriority
-        | GameAction::ReorderHand { .. } => {}
+        | GameAction::ReorderHand { .. }
+        | GameAction::BeginResolveAll { .. }
+        | GameAction::RespondResolveAllConsent { .. }
+        | GameAction::RevokeResolveAllConsent { .. } => {}
         _ => {
             state.auto_pass.remove(&actor);
         }
@@ -19763,7 +19782,10 @@ mod stage2_injector_tests {
                 //   `begin_pending_trigger_target_selection` is STILL 134 — the function opens
                 //   `:12722 ⇒ :12778`, moving by the same `+56` as the pin, so the control
                 //   that caught this row's one historical silent drift is intact.
-                "game/engine.rs:13094".to_string(),
+                //   Resolve All consent adds its frozen-authority protocol above this producer:
+                //   `:12912 ⇒ :13113`. It does not create a CR 603.5 prompt, and the pinned
+                //   line remains the same `OptionalEffectChoice` construction.
+                "game/engine.rs:13113".to_string(),
             ],
             "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
              plus the two repeated-optional-payment drivers, the per-player acceptance cursor \
