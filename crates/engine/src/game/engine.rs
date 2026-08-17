@@ -19301,9 +19301,12 @@ mod stage2_injector_tests {
                 // all MATCH). The round's other edits are the two new `#[cfg(test)]`
                 // tests, which are below all three and mint no prompt, so the `in_test`
                 // total is unchanged.
-                "game/effects/mod.rs:7261".to_string(),
-                "game/effects/mod.rs:7338".to_string(),
-                "game/effects/mod.rs:10618".to_string(),
+                // #7496's parked Cipher frame extends the exhaustive resume dispatch above
+                // all three producers. It adds six lines without assigning an optional-effect
+                // prompt, so the measured production producers move uniformly by `+6`.
+                "game/effects/mod.rs:7267".to_string(),
+                "game/effects/mod.rs:7344".to_string(),
+                "game/effects/mod.rs:10624".to_string(),
                 // UNMOVED across the rebase, and that is itself evidence the SET did not
                 // move: a census that had gained or lost a producer would not leave this
                 // entry both byte-identical AND at the same coordinate.
