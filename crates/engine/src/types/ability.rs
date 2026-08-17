@@ -3054,7 +3054,35 @@ pub enum Duration {
     /// source exiles another card. Used by "you may play that card until you
     /// exile another card with [this object]" source-linked exile grants.
     UntilSourceExilesAnotherCard,
+    /// CR 610.3: The exiled object returns to its previous zone immediately
+    /// after an opponent of the source's controller becomes the monarch.
+    UntilOpponentBecomesMonarch,
     Permanent,
+}
+
+/// A specified event that can end a CR 610.3 zone-change duration before the
+/// initial one-shot effect occurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DurationEvent {
+    SourceLeftBattlefield,
+    OpponentBecameMonarch,
+}
+
+impl Duration {
+    pub const fn zone_change_event(&self) -> Option<DurationEvent> {
+        match self {
+            Self::UntilHostLeavesPlay => Some(DurationEvent::SourceLeftBattlefield),
+            Self::UntilOpponentBecomesMonarch => Some(DurationEvent::OpponentBecameMonarch),
+            Self::UntilEndOfTurn
+            | Self::UntilEndOfCombat
+            | Self::UntilNextTurnOf { .. }
+            | Self::UntilEndOfNextTurnOf { .. }
+            | Self::UntilNextStepOf { .. }
+            | Self::ForAsLongAs { .. }
+            | Self::UntilSourceExilesAnotherCard
+            | Self::Permanent => None,
+        }
+    }
 }
 
 /// The attacker named by a force-block instruction.
@@ -21961,6 +21989,10 @@ pub struct EffectResolutionResult {
 /// Conditions in the sub_ability chain are evaluated against this context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SpellContext {
+    /// CR 610.3b: specified duration events observed after a triggered ability
+    /// triggered but before this initial zone-change effect occurred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duration_events: Vec<DurationEvent>,
     /// CR 118.1 + CR 119.4b: A completed resolution-time `PayCost` that paid
     /// life reports this amount to the immediate following "that much" clause.
     /// `Some(0)` is distinct from no life-payment channel at all, and the value
@@ -26199,6 +26231,35 @@ pub struct ResolvedAbility {
 }
 
 impl ResolvedAbility {
+    /// Whether this ability chain contains a zone change bounded by `event`.
+    pub(crate) fn contains_duration_event(&self, event: DurationEvent) -> bool {
+        (matches!(self.effect, Effect::ChangeZone { .. })
+            && self.duration.as_ref().and_then(Duration::zone_change_event) == Some(event))
+            || self
+                .sub_ability
+                .as_ref()
+                .is_some_and(|sub| sub.contains_duration_event(event))
+            || self
+                .else_ability
+                .as_ref()
+                .is_some_and(|branch| branch.contains_duration_event(event))
+    }
+
+    pub(crate) fn record_duration_event_recursive(&mut self, event: DurationEvent) {
+        if matches!(self.effect, Effect::ChangeZone { .. })
+            && self.duration.as_ref().and_then(Duration::zone_change_event) == Some(event)
+            && !self.context.duration_events.contains(&event)
+        {
+            self.context.duration_events.push(event);
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.record_duration_event_recursive(event);
+        }
+        if let Some(branch) = self.else_ability.as_mut() {
+            branch.record_duration_event_recursive(event);
+        }
+    }
+
     /// Build from a typed Effect. Simply stores the fields.
     pub fn new(
         effect: Effect,
@@ -29644,6 +29705,7 @@ mod tests {
             },
             Duration::UntilHostLeavesPlay,
             Duration::UntilSourceExilesAnotherCard,
+            Duration::UntilOpponentBecomesMonarch,
             Duration::Permanent,
         ];
         let json = serde_json::to_string(&durations).unwrap();
