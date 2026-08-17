@@ -6927,6 +6927,12 @@ pub enum QuantityRef {
         #[serde(default, skip_serializing_if = "is_total_damage_channel")]
         channel: DamageChannel,
     },
+    /// Engine bookkeeping for the immediately preceding resolution-local effect
+    /// count. This reads `GameState::last_effect_count` directly, defaults an
+    /// unavailable count to zero, and is not limited to object choices.
+    /// It preserves the immediate-predecessor relationship while instructions
+    /// resolve in order (CR 608.2c), so an enclosing event cannot shadow it.
+    PreviousEffectCount,
     /// CR 118.4 + CR 119.3: Amount of life lost this turn, scoped by `player`
     /// per the workspace "Parameterize, don't proliferate" principle (Round Π-3).
     ///
@@ -7454,6 +7460,7 @@ impl QuantityRef {
             | QuantityRef::TrackedSetAggregate { .. }
             | QuantityRef::ExiledFromHandThisResolution
             | QuantityRef::PreviousEffectAmount { .. }
+            | QuantityRef::PreviousEffectCount
             | QuantityRef::UnspentMana { .. }
             | QuantityRef::EventContextAmount
             | QuantityRef::EventContextPlayerCount { .. }
