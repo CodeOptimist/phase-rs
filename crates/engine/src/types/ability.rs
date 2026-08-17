@@ -25916,6 +25916,29 @@ pub enum ParentTargetMissingReason {
     RevealHandChoice,
 }
 
+/// CR 608.2c: what a chain split — a `player_scope` fan-out, or a multi-target
+/// player subject — DETACHED from this node's chain.
+///
+/// Why this exists: the publish gate for a tracked-set producer must judge the
+/// PRE-SPLIT chain. A splitter hands the per-iteration resolution a template
+/// whose remainder has been detached, so a structural walk over that template
+/// cannot see a producer surviving in the detached tail — the head would publish
+/// where the undetached chain declines, binding a later `TrackedSet` consumer to
+/// the wrong population. The verdict is purely structural, so it is computed
+/// once at split time and carried on the template rather than re-derived.
+///
+/// SOLE WRITERS: `split_player_scope_chain`, `split_multi_target_player_chain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DetachedRemainder {
+    /// Nothing was detached, or the detached remainder holds no producer in
+    /// publisher position. The template's own walk is the whole truth.
+    #[default]
+    NoProducer,
+    /// The detached remainder holds a node in publisher position, so this node
+    /// is NOT the sole producer of its pre-split chain and must not publish.
+    HoldsPublisher,
+}
+
 /// Runtime ability data passed to effect handlers at resolution time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedAbility {
@@ -26034,6 +26057,37 @@ pub struct ResolvedAbility {
     /// individual instructions selected from those modes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_mode_labels: Vec<String>,
+    /// CR 700.2 + CR 608.2c: Marks this node as the ROOT of one selected mode's
+    /// instructions, and gives its position in the resolution order.
+    ///
+    /// CR 700.2: "Each of those options is a mode" — distinct modes are distinct
+    /// instructions, not continuations of each other. CR 608.2c ("follows its
+    /// instructions in the order written … apply the rules of English") makes an
+    /// anaphor like "those cards" / "it" bind to its NEAREST antecedent, which
+    /// can never be a sibling mode's population. `build_chained_resolved`
+    /// linearizes every selected mode into ONE `sub_ability` chain, erasing that
+    /// boundary from the chain shape; this field restores it.
+    ///
+    /// CR 700.2d: the value is the OCCURRENCE ORDINAL (0-based position within
+    /// the ordered selection), NOT the printed mode index — "if a particular
+    /// mode is chosen multiple times, the spell is treated as if that mode
+    /// appeared that many times in sequence", so Eldrazi Confluence's `[1, 1]`
+    /// yields ordinals `0` and `1` at the same printed index. Index-keying would
+    /// collide the two occurrences into one instruction.
+    ///
+    /// `None` on every non-mode-root node, including within-mode continuation
+    /// steps and every ability of a non-modal spell.
+    ///
+    /// SOLE WRITER: `game::ability_utils::build_chained_resolved`. Do not stamp
+    /// it anywhere else — consumers rely on "is a mode root" being decidable
+    /// from this field alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_instruction_ordinal: Option<usize>,
+    /// CR 608.2c: the publisher-position verdict of the chain remainder a
+    /// splitter detached from this node. See [`DetachedRemainder`]. Default
+    /// (`NoProducer`) on every node that was never split.
+    #[serde(default)]
+    pub detached_remainder: DetachedRemainder,
     /// CR 608.2c: Repeat this ability N times (from "for each [X], [effect]").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_for: Option<QuantityExpr>,
@@ -26289,6 +26343,8 @@ impl ResolvedAbility {
             target_choice_timing: TargetChoiceTiming::Stack,
             description: None,
             selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
+            detached_remainder: DetachedRemainder::NoProducer,
             repeat_for: None,
             min_x_value: 0,
             announced_x: None,
