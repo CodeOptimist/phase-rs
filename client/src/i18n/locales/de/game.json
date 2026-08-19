@@ -1856,7 +1856,8 @@
         "card": "eine Karte",
         "treasure": "einen Schatz",
         "food": "eine Nahrung",
-        "tappedFish": "einen getappten Fisch"
+        "tappedFish": "einen getappten Fisch",
+        "extraTurn": "einen zusätzlichen Zug"
       }
     }
   },

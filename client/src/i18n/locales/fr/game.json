@@ -1856,7 +1856,8 @@
         "card": "une carte",
         "treasure": "un Trésor",
         "food": "un Aliment",
-        "tappedFish": "un Poisson engagé"
+        "tappedFish": "un Poisson engagé",
+        "extraTurn": "un tour supplémentaire"
       }
     }
   },
