@@ -10510,6 +10510,75 @@ fn draw_cards_equal_to_hand_difference_from_limit() {
     }
 }
 
+/// CR 608.2c: an `Otherwise` branch must inherit a comparison-derived
+/// "the difference" from the same conditional definition as its then branch.
+/// The counter parser emits a deferred `Variable("difference")` for the
+/// independently parsed else chain, so assembly must replace it with the
+/// antecedent's typed operands.
+#[test]
+fn otherwise_branch_binds_difference_from_antecedent_condition() {
+    let def = parse_effect_chain(
+        "If you have fewer than seven cards in hand, draw a card. Otherwise, put a number of +1/+1 counters on ~ equal to the difference.",
+        AbilityKind::Spell,
+    );
+
+    assert_eq!(
+        def.condition,
+        Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::Controller,
+                },
+            },
+            comparator: Comparator::LT,
+            rhs: QuantityExpr::Fixed { value: 7 },
+        }),
+        "then branch must retain the comparison that establishes the difference"
+    );
+    assert!(matches!(*def.effect, Effect::Draw { .. }));
+
+    let else_branch = def
+        .else_ability
+        .as_deref()
+        .expect("Otherwise must attach to the comparison-gated effect");
+    match else_branch.effect.as_ref() {
+        Effect::PutCounter {
+            counter_type,
+            count: QuantityExpr::Difference { left, right },
+            target: TargetFilter::SelfRef,
+        } => {
+            assert_eq!(
+                *counter_type,
+                crate::types::counter::CounterType::Plus1Plus1
+            );
+            assert_eq!(
+                **left,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    },
+                }
+            );
+            assert_eq!(**right, QuantityExpr::Fixed { value: 7 });
+        }
+        other => panic!(
+            "Otherwise counter effect must contain the typed comparison-derived Difference, got {other:?}"
+        ),
+    }
+    assert!(
+        !matches!(
+            else_branch.effect.as_ref(),
+            Effect::PutCounter {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { name }
+                },
+                ..
+            } if name == "difference"
+        ),
+        "Otherwise must not retain an unresolved difference placeholder"
+    );
+}
+
 /// CR 121.1 + CR 402: "if that player has more cards in hand than you, draw cards
 /// equal to the difference" — cross-player difference. Anchor: Slithermuse.
 #[test]
