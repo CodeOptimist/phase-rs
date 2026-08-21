@@ -16,9 +16,10 @@ use super::ability::{
     CostPaidObjectSnapshot, CounterCostSelection, DelayedTriggerCondition, DigRestOrder, Duration,
     EffectKind, FaceDownProfile, GameRestriction, KeywordAction, KickerVariant, LibraryPosition,
     ModalChoice, PermanentEntryMode, PileSource, QuantityExpr, ResolvedAbility,
-    SearchDestinationSplit, SearchSelectionConstraint, StackAbilityKind, StaticCondition,
-    TapCreaturesAggregate, TargetFilter, TargetRef, ThisWayCause, TriggerBaseSetInstanceRef,
-    TriggerCondition, TriggerDefinition, TriggerDefinitionRef, TriggerEntry,
+    SearchDestinationSplit, SearchOrderingHint, SearchSelectionConstraint, StackAbilityKind,
+    StaticCondition, TapCreaturesAggregate, TargetFilter, TargetRef, ThisWayCause,
+    TriggerBaseSetInstanceRef, TriggerCondition, TriggerDefinition, TriggerDefinitionRef,
+    TriggerEntry,
 };
 use super::attribution::ObjectAttribution;
 use super::card::{CardFace, PrintedCardRef, TokenImageRef};
@@ -4522,6 +4523,9 @@ pub struct PreparedScopedLibrarySearchChoice {
     pub up_to: bool,
     pub allows_partial_find: bool,
     pub constraint: SearchSelectionConstraint,
+    /// Whether the client must preserve and display the selected-card order.
+    #[serde(default)]
+    pub ordering_hint: SearchOrderingHint,
 }
 
 fn default_prepared_search_filter() -> TargetFilter {
@@ -11493,6 +11497,10 @@ pub enum WaitingFor {
         /// AI candidate enumerator to prune illegal combinations.
         #[serde(default)]
         constraint: SearchSelectionConstraint,
+        /// CR 401.4 + CR 701.23a + CR 608.2c: Whether the selected cards are
+        /// arranged in one library position by their owner in the continuation.
+        #[serde(default)]
+        ordering_hint: SearchOrderingHint,
         /// CR 701.23a + CR 608.2c: Split-destination metadata propagated from
         /// `Effect::SearchLibrary.split` (cultivate-class "put one onto the
         /// battlefield tapped and the other into your hand"). When set, the
@@ -27440,6 +27448,7 @@ mod tests {
                         up_to: false,
                         allows_partial_find: false,
                         constraint: SearchSelectionConstraint::None,
+                        ordering_hint: SearchOrderingHint::default(),
                     },
                     PreparedScopedLibrarySearchChoice {
                         player: PlayerId(1),
@@ -27453,6 +27462,7 @@ mod tests {
                         up_to: false,
                         allows_partial_find: false,
                         constraint: SearchSelectionConstraint::None,
+                        ordering_hint: SearchOrderingHint::default(),
                     },
                 ],
                 next_selection_index: 2,
@@ -27522,6 +27532,7 @@ mod tests {
             up_to: false,
             allows_partial_find: false,
             constraint: SearchSelectionConstraint::None,
+            ordering_hint: SearchOrderingHint::default(),
         });
         *next_selection_index = 3;
         *current_player = Some(PlayerId(2));
