@@ -212,7 +212,7 @@ pub enum PhaseOutCause {
 
 /// Stored back-face data for double-faced cards (DFCs).
 /// Populated when a Transform-layout card enters the game.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BackFaceData {
     pub name: String,
     pub power: Option<i32>,
@@ -1151,6 +1151,32 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_unlocks: Option<RoomUnlockState>,
 
+    /// CR 707.2 + CR 709.5b + CR 613.1a: the Room half data the winning
+    /// Layer-1a copy effect carried (`CopiableValues::room_halves`).
+    /// Layer-derived: set by `apply_copiable_values`, cleared by the Step-1
+    /// seed — so it expires with the copy effect. `room::effective_room_halves`
+    /// prefers it over the object's own printed halves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_room_halves: Option<crate::types::ability::RoomCopiableHalves>,
+
+    /// CR 707.9b: where the LAST Layer-1 copy naming of this object came
+    /// from this pass — `None` when no copy effect named it. An `Exception`
+    /// ("except its name is X") is the copy's final copiable name, so the
+    /// Room door gate must not replace it. Layer-derived: assigned by every
+    /// applied copy (`apply_copiable_values`) and by the `SetName` arm,
+    /// cleared by the Step-1 seed — a LATER ordinary copy therefore resets
+    /// an earlier exception (CR 613.1a timestamp order).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer1_name_origin: Option<crate::types::ability::CopiedNameOrigin>,
+
+    /// CR 707.9b: the BASE name's origin for a MATERIALIZED object (duplicate
+    /// conjure / copy-token creation of an exception-named copy) — persistent,
+    /// unlike the layer-derived marker above. The Step-1 seed restores the
+    /// runtime marker from this, so the exception outlives every later layer
+    /// pass. `None` for every ordinarily printed object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_name_origin: Option<crate::types::ability::CopiedNameOrigin>,
+
     /// CR 716.3: Class enchantment level. Present only on Class permanents.
     /// Class level is NOT a counter (CR 716) — proliferate/counter manipulation must not interact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1451,6 +1477,9 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         assigns_no_combat_damage: _,
         case_state: _,
         room_unlocks: _,
+        copied_room_halves: _,
+        layer1_name_origin: _,
+        base_name_origin: _,
         class_level: _,
         cast_from_zone: _,
         cast_controller: _,
@@ -2344,6 +2373,9 @@ impl GameObject {
             assigns_no_combat_damage: false,
             case_state: None,
             room_unlocks: None,
+            copied_room_halves: None,
+            layer1_name_origin: None,
+            base_name_origin: None,
             class_level: None,
             cast_from_zone: None,
             cast_controller: None,
