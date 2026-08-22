@@ -3532,7 +3532,10 @@ fn condition_reads_filter_population(
         | AbilityCondition::ZoneChangeObjectMatchesFilter { filter, .. }
         | AbilityCondition::ControllerControlsMatching { filter }
         | AbilityCondition::ControllerControlledMatchingAsCast { filter }
-        | AbilityCondition::ZoneChangedThisWay { filter }
+        | AbilityCondition::ZoneChangedThisWay {
+            filter,
+            destination: _,
+        }
         | AbilityCondition::CostPaidObjectMatchesFilter { filter } => has_filter(filter),
         AbilityCondition::RevealedHasCardType {
             additional_filter,
@@ -14203,13 +14206,24 @@ pub(crate) fn evaluate_condition(
         // CR 608.2c: "If a [noun] was [verb]ed this way" — check if any zone-changed
         // object matches the type filter. For optional-targeting parents with no targets
         // chosen, last_zone_changed_ids is empty → returns false.
-        AbilityCondition::ZoneChangedThisWay { filter } => {
+        AbilityCondition::ZoneChangedThisWay {
+            filter,
+            destination,
+        } => {
             // CR 107.3a + CR 601.2b: ability-context filter evaluation.
             let ctx = crate::game::filter::FilterContext::from_ability(ability);
-            state
-                .last_zone_changed_ids
-                .iter()
-                .any(|&id| crate::game::filter::matches_target_filter(state, id, filter, &ctx))
+            state.last_zone_changed_ids.iter().any(|&id| {
+                crate::game::filter::matches_target_filter(state, id, filter, &ctx)
+                    // CR 608.2c + CR 122.1h + CR 614.6: a destination-bound
+                    // wording ("put into a graveyard / dies this way") needs the
+                    // ARRIVAL, not just the move — a replacement that redirected
+                    // the object elsewhere defeats it. Current zone IS the
+                    // arrival zone here: nothing else runs between the parent
+                    // instruction and this evaluation.
+                    && destination.is_none_or(|zone| {
+                        state.objects.get(&id).is_some_and(|obj| obj.zone == zone)
+                    })
+            })
         }
         // CR 608.2k + CR 608.2h: the cost-paid object is a persistent untargeted
         // reference, so it reads CURRENT information while it is still in a
@@ -14874,6 +14888,39 @@ mod tests {
             PlayerId(0),
         )
         .condition(AbilityCondition::WhenYouDo)
+    }
+
+    /// CR 608.2c + CR 614.6: a destination-bound "this way" rider must not
+    /// see an object whose move was redirected away from its named arrival.
+    #[test]
+    fn zone_changed_this_way_requires_named_destination() {
+        let mut state = GameState::new_two_player(42);
+        let object = reflexive_test_creature(&mut state, PlayerId(0), "Test Creature");
+        state.last_zone_changed_ids = vec![object];
+        let ability = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: None,
+            },
+            Vec::new(),
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let condition = AbilityCondition::ZoneChangedThisWay {
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            destination: Some(Zone::Graveyard),
+        };
+
+        assert!(
+            !evaluate_condition(&condition, &state, &ability),
+            "a battlefield object does not satisfy a graveyard-bound rider"
+        );
+
+        state.objects.get_mut(&object).unwrap().zone = Zone::Graveyard;
+        assert!(
+            evaluate_condition(&condition, &state, &ability),
+            "the same tracked object satisfies the rider after arriving in the graveyard"
+        );
     }
 
     #[test]
@@ -33050,7 +33097,10 @@ mod tests {
             AbilityCondition::CostPaidObjectMatchesFilter { filter: anaphor() },
             AbilityCondition::TriggeringSpellTargetsFilter { filter: anaphor() },
             AbilityCondition::ControllerControlledMatchingAsCast { filter: anaphor() },
-            AbilityCondition::ZoneChangedThisWay { filter: anaphor() },
+            AbilityCondition::ZoneChangedThisWay {
+                filter: anaphor(),
+                destination: None,
+            },
             AbilityCondition::PostReplacementDamageSourceMatchesFilter { filter: anaphor() },
             AbilityCondition::TargetSharesNameWithOtherExiledThisWay { target: anaphor() },
             AbilityCondition::ObjectsShareQuality {
@@ -33092,6 +33142,7 @@ mod tests {
         assert!(!condition_depends_on_last_created(
             &AbilityCondition::ZoneChangedThisWay {
                 filter: TargetFilter::LastZoneChanged,
+                destination: None,
             }
         ));
     }
