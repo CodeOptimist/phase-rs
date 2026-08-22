@@ -109,6 +109,7 @@ interface MultiplayerDraftState {
   timerRemainingMs: number | null;
   standings: StandingEntry[];
   currentRound: number;
+  nextPairingRound: number;
   pairings: PairingView[];
   /** Full deck submitted during deckbuilding (mainDeck + lands). */
   submittedDeck: string[];
@@ -146,6 +147,8 @@ interface MultiplayerDraftActions {
   submitPickWithDraftEffect: (effectCardInstanceId: string, cardInstanceIds: string[]) => Promise<void>;
   /** Both: select a card (UI highlight before confirming pick). */
   selectCard: (cardInstanceId: string | null) => void;
+  /** Both: dismiss the current error banner. */
+  clearError: () => void;
   /** Both: confirm the currently selected card as pick. */
   confirmPick: () => Promise<void>;
   /** Both: pick a card from the current pack using a deterministic draft heuristic. */
@@ -497,6 +500,7 @@ const initialState: MultiplayerDraftState = {
   timerRemainingMs: null,
   standings: [],
   currentRound: 0,
+  nextPairingRound: 1,
   pairings: [],
   submittedDeck: [],
   matchPairing: null,
@@ -601,6 +605,8 @@ export const useMultiplayerDraftStore = create<
   selectCard: (cardInstanceId) => {
     set({ selectedCard: cardInstanceId });
   },
+
+  clearError: () => set({ error: null }),
 
   confirmPick: async () => {
     const { selectedCard, submitPick } = get();
@@ -1090,6 +1096,7 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
         timerRemainingMs: event.view.timer_remaining_ms ?? null,
         standings: event.view.standings ?? [],
         currentRound: event.view.current_round ?? 0,
+        nextPairingRound: event.view.next_pairing_round ?? 1,
         pairings: event.view.pairings ?? [],
       });
       {
@@ -1123,7 +1130,19 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
       set({ paused: false, pauseReason: null });
       break;
     case "pairingsGenerated":
-      set({ phase: "matchInProgress", currentRound: event.round, pairings: event.pairings });
+      // Host-only supersession: `advanceRound()` emits its own failure as
+      // `error`, so a successful retry of that exact operation clears the
+      // banner. This clears *any* live error, not just that one — accepted,
+      // because `pairingsGenerated` fires once per round boundary, so anything
+      // it erases has already had a full round on screen. Guests have no
+      // `pairingsGenerated` handler, so for them `clearError` (the banner's
+      // dismiss control) is the only clearing path.
+      set({
+        phase: "matchInProgress",
+        currentRound: event.round,
+        pairings: event.pairings,
+        error: null,
+      });
       saveDraftPodProgress("matchInProgress");
       break;
     case "matchStart":
@@ -1228,6 +1247,7 @@ function handleGuestEvent(event: DraftPodGuestEvent, set: SetFn): void {
         timerRemainingMs: event.view.timer_remaining_ms ?? null,
         standings: event.view.standings ?? [],
         currentRound: event.view.current_round ?? 0,
+        nextPairingRound: event.view.next_pairing_round ?? 1,
         pairings: event.view.pairings ?? [],
       });
       break;

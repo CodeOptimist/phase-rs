@@ -100,6 +100,7 @@ function mockView(status: string): DraftPlayerView {
     timer_remaining_ms: null,
     standings: [],
     current_round: 0,
+    next_pairing_round: 1,
     tournament_format: "Swiss",
     pod_policy: "Competitive",
     pairings: [],
@@ -220,6 +221,53 @@ describe("multiplayerDraftStore", () => {
       const state = useMultiplayerDraftStore.getState();
       expect(state.phase).toBe("matchInProgress");
       expect(state.view).toBe(view);
+    });
+
+    it("pairingsGenerated advances currentRound, leaves nextPairingRound to viewUpdated, and supersedes the error", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { set_pool_json: "{}" } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+
+      // The host's real round boundary: the engine view for round 2 arrives
+      // first, then pairing generation commits round 3.
+      const view = {
+        ...mockView("MatchInProgress"),
+        current_round: 2,
+        next_pairing_round: 3,
+      };
+      capturedHostEventHandler!({ type: "viewUpdated", view });
+      // Reach-guard: prove the error is live before the boundary, so a null
+      // afterwards cannot mean "it was never set".
+      capturedHostEventHandler!({
+        type: "error",
+        message: "Failed to advance round",
+      });
+      expect(useMultiplayerDraftStore.getState().error).toBe(
+        "Failed to advance round",
+      );
+      capturedHostEventHandler!({ type: "pairingsGenerated", round: 3, pairings: [] });
+
+      const state = useMultiplayerDraftStore.getState();
+      // Reach-guards: both events were demonstrably delivered, so a wrong
+      // `nextPairingRound` cannot be confused with "no event reached the store".
+      expect(state.view).toBe(view);
+      expect(state.phase).toBe("matchInProgress");
+      expect(state.currentRound).toBe(3);
+      // `pairingsGenerated` writes only the round it owns. The `3 / 3` relation
+      // is the deliberate window, not an accident: anyone later adding an
+      // inlined `nextPairingRound: event.round + 1` to that handler — the
+      // TypeScript re-derivation this work exists to abolish — yields 4 here.
+      expect(state.nextPairingRound).toBe(3);
+      // REVERT-FAILING: drop `error: null` from the `pairingsGenerated` handler
+      // and this goes red. A successful round boundary supersedes the banner the
+      // failed attempt raised — without it the retry that WORKED still shows
+      // "Failed to advance round".
+      expect(state.error).toBeNull();
     });
 
     it("handles host-seat Bo3 prompt messages", async () => {
