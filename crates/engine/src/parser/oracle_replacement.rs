@@ -7405,9 +7405,15 @@ pub(crate) fn parse_choose_damage_source_candidate(input: &str) -> Option<Target
     None
 }
 
-/// Parse the damage source filter from the subject clause before "would deal".
-fn parse_damage_source_filter(norm_lower: &str) -> Option<TargetFilter> {
-    let (_, (subject, _)) = nom_primitives::split_once_on(norm_lower, "would deal").ok()?;
+/// Shared subject-postprocessing tail for damage-source subject extraction,
+/// factored out of `parse_damage_source_filter` so the active-voice
+/// ("<subject> would deal..."), passive-voice ("...dealt by <subject>"), and
+/// bidirectional-ellipsis ("...dealt to and dealt by <subject>") extraction
+/// sites all share one postprocessing authority instead of duplicating it.
+/// Handles ability-word "if " unwrapping, self-reference resolution, article
+/// stripping, and the untyped "a spell"/"a source" no-filter cases before
+/// delegating to `parse_damage_source_subject_filter`.
+fn finish_damage_source_subject(subject: &str) -> Option<TargetFilter> {
     let subject = subject.trim();
 
     // Handle ability word prefixes ("Revolt — ..., if a source you control")
@@ -7446,11 +7452,102 @@ fn parse_damage_source_filter(norm_lower: &str) -> Option<TargetFilter> {
         return None;
     }
 
-    if let Some(filter) = parse_damage_source_subject_filter(subject) {
-        return Some(filter);
-    }
+    parse_damage_source_subject_filter(subject)
+}
 
-    None
+/// Isolate the source-subject clause following a "dealt by " (or "dealt to
+/// and dealt by ") anchor, at the same clause-boundary terminator set
+/// `parse_damage_recipient_after_prefix` validates for the symmetric
+/// recipient-side scan (`oracle_replacement.rs:10932-10951`): end of text, a
+/// sentence period, or a trailing "this turn"/"until end of turn" duration
+/// qualifier.
+///
+/// Deliberately NOT a plain `alt()` over three `take_until` branches: each
+/// `take_until(pat)` only guarantees `pat` occurs *somewhere* later in the
+/// input, not that it is the *nearest* terminator, so trying branches in a
+/// fixed priority order picks whichever is listed first rather than
+/// whichever terminator actually occurs earliest — silently swallowing a
+/// closer terminator into the subject (e.g. `"enchanted creature until end
+/// of turn."` would wrongly capture `"enchanted creature until end of
+/// turn"` if `take_until(".")` were tried first, since the only period is
+/// at the very end). Instead: try all three, then keep whichever candidate
+/// consumed the *least* input — the terminator with the smallest offset.
+fn take_damage_source_subject_clause(input: &str) -> OracleResult<'_, &str> {
+    let candidates: [OracleResult<'_, &str>; 3] = [
+        terminated(
+            take_until::<_, _, OracleError<'_>>("."),
+            tag::<_, _, OracleError<'_>>("."),
+        )
+        .parse(input),
+        terminated(
+            take_until::<_, _, OracleError<'_>>(" this turn"),
+            tag::<_, _, OracleError<'_>>(" this turn"),
+        )
+        .parse(input),
+        terminated(
+            take_until::<_, _, OracleError<'_>>(" until end of turn"),
+            tag::<_, _, OracleError<'_>>(" until end of turn"),
+        )
+        .parse(input),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .min_by_key(|(_, subject): &(&str, &str)| subject.len())
+        .map_or_else(|| rest(input), Ok)
+}
+
+/// Parse the damage source filter from the subject clause before "would deal"
+/// (active voice: "<subject> would deal damage...").
+fn parse_damage_source_filter_active(norm_lower: &str) -> Option<TargetFilter> {
+    let (_, (subject, _)) = nom_primitives::split_once_on(norm_lower, "would deal").ok()?;
+    finish_damage_source_subject(subject)
+}
+
+/// Parse the damage source filter from passive-voice phrasing — "...would be
+/// dealt ... by <subject>" (Candletrap, Defang) — where the source subject
+/// trails the verb, unlike the active-voice "<subject> would deal ...".
+/// Anchored at "dealt by " (mirrors the existing recipient-side "dealt to "
+/// scan in `parse_damage_recipient_after_prefix`), isolating the subject
+/// clause at the shared clause-boundary terminator before handing it to
+/// `finish_damage_source_subject` — the same postprocessing authority the
+/// active-voice extraction uses.
+fn parse_damage_source_filter_passive(norm_lower: &str) -> Option<TargetFilter> {
+    // Bail out entirely when the text carries a "doesn't affect .../does not
+    // affect ..." exception clause (Undergrowth: "Prevent all combat damage
+    // that would be dealt this turn. If this spell's additional cost was
+    // paid, this effect doesn't affect combat damage that would be dealt by
+    // red creatures.") — an unconstrained scan for "dealt by " would latch
+    // onto the EXCLUSION's subject ("red creatures") and wrongly report it as
+    // the shield's OWN source scope, inverting the card's actual meaning
+    // (the shield protects against everyone EXCEPT that subject, not ONLY
+    // that subject). This class of conditional exception is not implemented
+    // by this recognizer at all — bailing to `None` here preserves the
+    // pre-existing, honest "unscoped" representation for such cards rather
+    // than fabricating a backwards-wrong one. Confirmed via card-data.json
+    // parse-diff on PR #7615: Undergrowth was the only corpus card this
+    // passive scan wrongly touched.
+    if nom_primitives::scan_contains(norm_lower, "doesn't affect")
+        || nom_primitives::scan_contains(norm_lower, "does not affect")
+    {
+        return None;
+    }
+    let subject = nom_primitives::scan_at_word_boundaries(norm_lower, |input| {
+        preceded(
+            tag::<_, _, OracleError<'_>>("dealt by "),
+            take_damage_source_subject_clause,
+        )
+        .parse(input)
+    })?;
+    finish_damage_source_subject(subject)
+}
+
+/// Parse the damage source filter, trying active voice first, then passive
+/// voice (CR 615.1a). Both anchors delegate the isolated subject to the
+/// shared `finish_damage_source_subject` postprocessing tail.
+fn parse_damage_source_filter(norm_lower: &str) -> Option<TargetFilter> {
+    parse_damage_source_filter_active(norm_lower)
+        .or_else(|| parse_damage_source_filter_passive(norm_lower))
 }
 
 /// CR 301.5 + CR 702.6: "equipped creature" (Equipment) and "enchanted
@@ -10496,6 +10593,87 @@ fn parse_subject_first_prevention_recipient(input: &str) -> OracleResult<'_, Tar
     terminated(parse_attached_subject_target_filter, tag(" would be dealt")).parse(input)
 }
 
+/// CR 614.1a + CR 615.1a + CR 616.1: "Prevent all [combat] damage that would
+/// be dealt to and dealt by <subject>" (Statecraft, Fog Bank, Gaseous Form,
+/// Ghostly Possession, Sandskin, Heart of Light) is an English ellipsis: the
+/// object of "dealt to" is elided because it is identical to "dealt by"'s
+/// object. `valid_card` (matches the event RECIPIENT) and
+/// `damage_source_filter` (CR 614.1a, matches the event SOURCE — see
+/// `game/replacement.rs` `object_replacement_candidate_applies`) each inspect
+/// a *different* object on a `Damage` event and are ANDed together when both
+/// are set on the SAME `ReplacementDefinition` — but this clause needs OR
+/// semantics across the two roles ("prevented if the recipient is <subject>,
+/// OR if the source is <subject>", independently, not simultaneously). So
+/// this recognizer emits TWO independent `ReplacementDefinition`s sharing
+/// `combat_scope`/`shield_kind`/`description` — one scoped via `valid_card`
+/// (recipient half), one via `damage_source_filter` (source half) — and the
+/// OR emerges at the candidate-`Vec` level (`find_applicable_replacements`),
+/// not inside one definition (CR 616.1 governs the player choice when both
+/// end up matching the same event, e.g. a self-damage case).
+///
+/// Self-ref subjects ("~", already normalized from "this creature"/the card's
+/// own name by `normalize_card_name_refs` before this function runs, e.g. Fog
+/// Bank) are unified into the same two-definition shape as any other subject
+/// rather than carved into a separate branch, so a self-ref subject can never
+/// collide with the now-generalized `parse_damage_source_filter` (Gap A)
+/// landing both fields on one definition (plan review round 1's Fog Bank
+/// regression note).
+pub(crate) fn parse_bidirectional_damage_prevention(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<Vec<ReplacementDefinition>> {
+    // This recognizer only claims the "prevent all" shield shape; "prevent
+    // the next N" / "prevent all but N" ellipsis phrasing is not attested by
+    // any sampled card sharing this construction, so it is left to fall
+    // through to the general single-definition path rather than
+    // speculatively supported here (no card needs it, per the plan's
+    // pattern-coverage sample). "prevent all" is a substring of "prevent all
+    // but N", so the guard must reject that phrasing explicitly — a bare
+    // `scan_contains(norm_lower, "prevent all")` check would wrongly accept
+    // it as `PreventionAmount::All` (over-preventing) instead of deferring to
+    // the general path's `AllBut(N)` handling (CR 615.1a), which already
+    // anchors this exact ambiguity at `strip_after(working_lower, "prevent
+    // ")` + `tag("all but ")` before falling back to bare "all" below in
+    // `parse_damage_prevention_replacement`. Review-impl (CodeRabbit) finding
+    // on PR #7615 — latent, since no card in the current corpus combines
+    // "all but N" with this ellipsis, but still worth closing.
+    if !nom_primitives::scan_contains(norm_lower, "prevent all")
+        || nom_primitives::scan_contains(norm_lower, "prevent all but")
+    {
+        return None;
+    }
+
+    let subject_raw = nom_primitives::scan_at_word_boundaries(norm_lower, |input| {
+        preceded(
+            tag::<_, _, OracleError<'_>>("dealt to and dealt by "),
+            take_damage_source_subject_clause,
+        )
+        .parse(input)
+    })?;
+    let subject = finish_damage_source_subject(subject_raw)?;
+
+    // CR 615: "combat damage" restricts the shield to combat damage only.
+    // Reused as-is from `parse_damage_modification_replacement`/
+    // `parse_damage_modification_static` — this recognizer is a standalone
+    // dispatch arm that bypasses `parse_damage_prevention_replacement`
+    // entirely, so nothing else computes this value for it. Omitting this
+    // would silently over-broaden the shield from "combat damage only" to
+    // "all damage" for every combat-scoped card in this family.
+    let combat_scope = scan_combat_scope(norm_lower);
+
+    let mut base = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+        .prevention_shield(PreventionAmount::All)
+        .description(original_text.to_string());
+    if let Some(cs) = combat_scope {
+        base = base.combat_scope(cs);
+    }
+
+    let recipient_half = base.clone().valid_card(subject.clone());
+    let source_half = base.damage_source_filter(subject);
+
+    Some(vec![recipient_half, source_half])
+}
+
 /// CR 615: Parse damage prevention replacement effects.
 /// Handles:
 /// - "prevent all combat damage that would be dealt [this turn]" (Fog, Moments Peace)
@@ -10681,8 +10859,16 @@ fn parse_damage_prevention_replacement(
     // `damage_target_filter = None` caused the shield to prevent ALL damage to
     // any target, which was the Multiclass Baldric / Inviolability / Artifact Ward
     // class of bug.
+    // Note: the "dealt to and dealt by ~" ellipsis arm that used to live here
+    // was removed — it is now handled, for every subject including self-ref,
+    // by the unified `parse_bidirectional_damage_prevention` recognizer (a
+    // standalone dispatch arm in `oracle.rs` tried before this function is
+    // ever reached for that shape). Leaving a self-ref-only carve-out here
+    // would let it collide with the now-generalized `parse_damage_source_filter`
+    // (Gap A) landing BOTH `valid_card: SelfRef` and `damage_source_filter:
+    // SelfRef` on one definition — AND semantics that silently narrow the
+    // shield (plan review round 1's Fog Bank regression).
     let valid_card_filter: Option<TargetFilter> = if nom_primitives::scan_contains(working_lower, "dealt to ~")
-            || nom_primitives::scan_contains(working_lower, "dealt to and dealt by ~")
             // CR 615.1: Active-voice self-recipient form — "If a source would
             // deal damage to ~, prevent that damage ..." (Swans of Bryn Argoll —
             // #5652). A prevention effect is a "shield around whatever it's
@@ -11925,6 +12111,84 @@ mod tests {
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
+
+    /// `take_damage_source_subject_clause` must stop at whichever terminator
+    /// occurs EARLIEST in the text, not whichever is tried first. Regression
+    /// guard for a review finding: a plain `alt()` over three `take_until`
+    /// branches (period, "this turn", "until end of turn") in a fixed
+    /// priority order picks whichever branch is listed first — since
+    /// `take_until(".")` only requires a period to exist *somewhere* later,
+    /// it would wrongly swallow "until end of turn" into the subject when the
+    /// only period is at the very end of the sentence, even though "until end
+    /// of turn" is the nearer boundary.
+    #[test]
+    fn take_damage_source_subject_clause_stops_at_earliest_terminator() {
+        let (_, subject) =
+            take_damage_source_subject_clause("enchanted creature until end of turn.")
+                .expect("terminator scan should succeed");
+        assert_eq!(
+            subject, "enchanted creature",
+            "must stop at the nearer 'until end of turn' terminator, not swallow it \
+             by chasing the sentence-final period"
+        );
+
+        // Sibling ordering: "this turn" nearer than a later period.
+        let (_, subject) =
+            take_damage_source_subject_clause("that creature this turn, prevent that damage.")
+                .expect("terminator scan should succeed");
+        assert_eq!(subject, "that creature");
+
+        // Plain period still works when it is the only/nearest terminator.
+        let (_, subject) = take_damage_source_subject_clause("creatures you control.")
+            .expect("terminator scan should succeed");
+        assert_eq!(subject, "creatures you control");
+    }
+
+    /// Corpus regression, found via PR #7615's card-data.json parse-diff:
+    /// `parse_damage_source_filter_passive`'s unconstrained "dealt by "
+    /// scan must NOT latch onto a "doesn't affect ... dealt by <subject>"
+    /// exception clause and report that subject as the shield's OWN source
+    /// scope — that inverts the card's actual meaning (protects against
+    /// everyone EXCEPT the named subject, not ONLY the named subject).
+    /// Verbatim text (a card whose oracle text has this exact shape).
+    #[test]
+    fn passive_source_filter_ignores_doesnt_affect_exception_clause() {
+        let text = "prevent all combat damage that would be dealt this turn. if this \
+                     spell's additional cost was paid, this effect doesn't affect combat \
+                     damage that would be dealt by red creatures.";
+        assert_eq!(
+            parse_damage_source_filter_passive(text),
+            None,
+            "an unconstrained 'dealt by' scan must not treat the exclusion clause's \
+             subject as the shield's own source filter — this recognizer does not \
+             implement conditional exceptions at all, so it must stay None (honest \
+             gap) rather than fabricate a backwards-wrong scope"
+        );
+
+        // "does not affect" (unabbreviated) must be rejected the same way.
+        let text_unabbreviated = "prevent all damage that would be dealt this turn. this \
+                                   effect does not affect damage that would be dealt by \
+                                   artifact creatures.";
+        assert_eq!(
+            parse_damage_source_filter_passive(text_unabbreviated),
+            None,
+            "the unabbreviated 'does not affect' phrasing must be rejected identically \
+             to the contracted 'doesn't affect' form"
+        );
+
+        // Positive reach-guard: a genuine passive "dealt by X" match (no
+        // exception clause in the text at all) must still succeed — proves
+        // the guard rejects only text containing the negation phrase, not
+        // passive-voice matching in general.
+        assert!(
+            parse_damage_source_filter_passive(
+                "prevent all damage that would be dealt by enchanted creature."
+            )
+            .is_some(),
+            "the negation guard must not suppress ordinary passive-voice matches \
+             that carry no 'doesn't/does not affect' clause"
+        );
+    }
 
     /// Sheriff of Safe Passage: "enters with a +1/+1 counter on it plus an
     /// additional +1/+1 counter on it for each other creature you control." The
@@ -13647,26 +13911,44 @@ mod tests {
         ));
     }
 
-    /// Anti-Venom self-scoped prevention must use `valid_card: SelfRef`, not `CreatureOnly`.
+    /// Anti-Venom self-scoped prevention must use `valid_card: SelfRef`, not
+    /// `CreatureOnly`.
+    ///
+    /// Anti-Venom's real, verbatim Oracle text (verified against Scryfall) is
+    /// single-direction only: "If damage would be dealt to Anti-Venom, prevent
+    /// that damage and put that many +1/+1 counters on him." — no "and dealt
+    /// by" clause. This test previously also asserted a second, FABRICATED
+    /// text variant — "If damage would be dealt to and dealt by ~, prevent
+    /// that damage and put that many +1/+1 counters on him." — that does not
+    /// correspond to any printed card (confirmed both against Scryfall for
+    /// this specific card and against every card in `client/public/card-data.json`
+    /// containing the phrase "dealt to and dealt by": none use "prevent that
+    /// damage" — a one-shot conditional-rider prevention — combined with the
+    /// bidirectional ellipsis; every real card using that ellipsis uses
+    /// "prevent all damage", a static shield). That fabricated variant is
+    /// removed here rather than special-cased, per CLAUDE.md's "verify the
+    /// card, not just the rule": preserving behavior for a shape no real card
+    /// uses is not owed, and doing so would reintroduce the exact AND-collision
+    /// risk plan review round 1 identified for Fog Bank (landing both
+    /// `valid_card: SelfRef` and, once Gap A's passive-voice `dealt by ~`
+    /// recognition also fires, `damage_source_filter: SelfRef` on the SAME
+    /// definition) for a card that does not exist.
     #[test]
     fn anti_venom_self_prevention_uses_valid_card_self_ref() {
-        for text in [
-            "If damage would be dealt to ~, prevent that damage and put that many +1/+1 counters on him.",
-            "If damage would be dealt to and dealt by ~, prevent that damage and put that many +1/+1 counters on him.",
-        ] {
-            let def = parse_replacement_line(text, "Anti-Venom, Horrifying Healer")
-                .expect("Anti-Venom prevention should parse");
+        let text =
+            "If damage would be dealt to ~, prevent that damage and put that many +1/+1 counters on him.";
+        let def = parse_replacement_line(text, "Anti-Venom, Horrifying Healer")
+            .expect("Anti-Venom prevention should parse");
 
-            assert_eq!(
-                def.valid_card,
-                Some(TargetFilter::SelfRef),
-                "self-scoped prevention must gate on SelfRef: {text}"
-            );
-            assert!(
-                def.damage_target_filter.is_none(),
-                "must not use broad CreatureOnly damage_target_filter: {text}"
-            );
-        }
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::SelfRef),
+            "self-scoped prevention must gate on SelfRef: {text}"
+        );
+        assert!(
+            def.damage_target_filter.is_none(),
+            "must not use broad CreatureOnly damage_target_filter: {text}"
+        );
     }
 
     /// CR 615.1a: Temple Altisaur — "If a source would deal damage to another

@@ -96,8 +96,9 @@ use super::oracle_modal::{
 };
 use super::oracle_replacement::{
     find_copy_verb_present, lower_as_enters_becomes_choice_modal,
-    lower_as_enters_or_face_up_counters, lower_replacement_ir, parse_replacement_line,
-    parse_replacement_line_ir, parse_whenever_you_cast_enters_with_trigger,
+    lower_as_enters_or_face_up_counters, lower_replacement_ir,
+    parse_bidirectional_damage_prevention, parse_replacement_line, parse_replacement_line_ir,
+    parse_whenever_you_cast_enters_with_trigger,
 };
 use super::oracle_saga::{is_saga_chapter, parse_saga_chapters};
 use super::oracle_spacecraft::parse_spacecraft_threshold_lines;
@@ -6051,6 +6052,34 @@ pub(crate) fn parse_oracle_ir(
             if let Some(replacement_irs) = lower_as_enters_or_face_up_counters(&line) {
                 for replacement_ir in replacement_irs {
                     emitter.replacement_ir_at(item_line, replacement_ir);
+                }
+                i += 1;
+                continue;
+            }
+            // CR 614.1a + CR 616.1: "Prevent all [combat] damage that would
+            // be dealt to and dealt by <subject>" is an English ellipsis that
+            // needs TWO independent `ReplacementDefinition`s (recipient half +
+            // source half) from one physical sentence — the same "one line ->
+            // Vec<ReplacementIr>" multi-emit shape `lower_as_enters_or_face_up_counters`
+            // uses above, so it runs at the same tier, right after it. Must
+            // also run BEFORE `parse_replacement_sentence_sequence_ir` below,
+            // not just before the generic single-definition
+            // `parse_replacement_line_ir`: if a future card ever puts this
+            // ellipsis sentence on the same physical line as a second
+            // period-terminated replacement sentence, the sequence parser
+            // would otherwise treat the ellipsis sentence as one more ordinary
+            // sentence and hand it to `parse_replacement_line_ir` per-sentence
+            // (via its own internal loop), which can only ever populate one of
+            // the two scoping fields — silently reintroducing this PR's bug
+            // for that shape. No card in the current corpus combines the two,
+            // so this was a latent gap (review-impl finding on PR #7615), not
+            // an active misparse.
+            if let Some(definitions) = parse_bidirectional_damage_prevention(&lower, &line) {
+                for definition in definitions {
+                    emitter.replacement_ir_at(
+                        item_line,
+                        ReplacementIr::from_definition(&line, definition),
+                    );
                 }
                 i += 1;
                 continue;
