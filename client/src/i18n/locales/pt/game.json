@@ -2127,7 +2127,8 @@
     "title": "{{name}} - Efeito Opcional",
     "yes": "Sim",
     "no": "Não",
-    "dontAskAgain": "Não perguntar novamente neste jogo"
+    "dontAskAgain": "Não perguntar novamente neste jogo",
+    "dontAskAgainForSameCard": "Aplicar a todas as cópias desta carta"
   },
   "topOrBottom": {
     "cardFallback": "Card",

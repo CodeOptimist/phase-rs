@@ -2127,7 +2127,8 @@
     "title": "{{name}} - Effet facultatif",
     "yes": "Oui",
     "no": "Non",
-    "dontAskAgain": "Ne plus demander pendant cette partie"
+    "dontAskAgain": "Ne plus demander pendant cette partie",
+    "dontAskAgainForSameCard": "Appliquer à chaque exemplaire de cette carte"
   },
   "topOrBottom": {
     "cardFallback": "Card",
