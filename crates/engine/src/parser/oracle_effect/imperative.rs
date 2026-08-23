@@ -39,8 +39,8 @@ use crate::types::ability::{
     CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser, ContinuousModification,
     ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, DigSource, DoorLockOp,
     Duration, Effect, EffectScope, FaceDownProfile, FilterProp, ForceBlockAttackerRef,
-    GrantedAbilityScope, LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PlayerScope,
-    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
+    GrantedAbilityScope, LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PerPlayerScope,
+    PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
     ReassembleControlMode, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
     TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
     ZoneOwner,
@@ -4597,7 +4597,7 @@ pub(super) fn parse_for_each_player_choose_from_zone(
         return Some(ChooseImperativeAst::FromZone {
             count,
             zones,
-            zone_owner: ZoneOwner::EachPlayer,
+            zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
             filter,
             chooser,
             up_to,
@@ -4694,11 +4694,13 @@ fn parse_controlled_battlefield_body(
 /// optionally zero via "up to one"), accumulated into the chain's tracked set,
 /// then ALL chosen permanents are exiled (`ChangeZoneAll { TrackedSet }`).
 ///
-/// "for each player" iterates every player (`ZoneOwner::EachPlayer`); "for each
-/// other player" excludes the controller (`ZoneOwner::EachOpponent`). Emitted as
-/// a `ChooseFromZone { EachPlayer/EachOpponent }` clause with the mass-exile as
-/// its `sub_ability`, mirroring how the choose-only cards chain a separate
-/// "exile those" sentence.
+/// CR 101.4: "for each player" iterates every player in APNAP order
+/// (`PerPlayerScope::AllPlayers`). CR 102.3: "for each other player" is the same
+/// walk with the controller removed (`PerPlayerScope::OtherPlayers`) — every
+/// player except you, teammates included, which is why this is not the
+/// team-relative opponent set. Emitted as a `ChooseFromZone { Each(..) }` clause
+/// with the mass-exile as its `sub_ability`, mirroring how the choose-only cards
+/// chain a separate "exile those" sentence.
 pub(super) fn parse_for_each_player_exile_controlled(
     lower: &str,
     ctx: &mut ParseContext,
@@ -4707,12 +4709,21 @@ pub(super) fn parse_for_each_player_exile_controlled(
 
     let (after_prefix, iter_scope) = alt((
         value(
-            ZoneOwner::EachOpponent,
+            ZoneOwner::Each(PerPlayerScope::OtherPlayers),
             tag::<_, _, E>("for each other player, "),
         ),
-        value(ZoneOwner::EachOpponent, tag("for each other player ")),
-        value(ZoneOwner::EachPlayer, tag("for each player, ")),
-        value(ZoneOwner::EachPlayer, tag("for each player ")),
+        value(
+            ZoneOwner::Each(PerPlayerScope::OtherPlayers),
+            tag("for each other player "),
+        ),
+        value(
+            ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            tag("for each player, "),
+        ),
+        value(
+            ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            tag("for each player "),
+        ),
     ))
     .parse(lower)
     .ok()?;
