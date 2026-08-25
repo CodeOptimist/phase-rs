@@ -3366,6 +3366,13 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             acc
         }
         TriggerCondition::AttackedThisTurn => Axes::NONE,
+        // CR 701.54a + CR 701.54d: the condition reads the triggering
+        // temptation's immutable chosen bearer.
+        TriggerCondition::ChoseOtherRingBearer => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
         TriggerCondition::FirstCombatPhaseOfTurn => Axes {
             event: false,
             sibling: false,
@@ -8153,5 +8160,21 @@ mod tests {
             scanned.event || scanned.sibling || scanned.projected,
             "PlayerMatching over a life-total predicate must not scan as NONE"
         );
+    }
+
+    /// Review #7820 round 5: the condition consumes the triggering event's
+    /// snapshotted bearer — event-bound, so two distinct temptations are never
+    /// modeled as independent by ordering/conflict analysis.
+    #[test]
+    fn chose_other_ring_bearer_is_event_bound() {
+        use crate::types::ability::TriggerCondition;
+
+        let axes = scan_trigger_condition(
+            &TriggerCondition::ChoseOtherRingBearer,
+            ScanMode::Conservative,
+        );
+        assert!(axes.event, "must be event-bound");
+        assert!(!axes.sibling);
+        assert!(!axes.projected);
     }
 }

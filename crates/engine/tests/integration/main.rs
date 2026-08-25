@@ -1239,6 +1239,7 @@ mod issue_5263_chaos_warp;
 mod issue_6367_thassas_oracle;
 mod issue_7467_manifest_dread_tracked_set;
 mod issue_7552_role_token_image_ref;
+mod issue_7795_put_choice_from_among_trigger;
 mod issue_7821_bare_plural_enters_with_counters;
 mod kang_dynasty_until_next_turn_rider;
 mod karplusan_yeti_fight_back;

@@ -1944,6 +1944,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
         | TriggerCondition::WasType { .. }
         | TriggerCondition::AttackedThisTurn
+        | TriggerCondition::ChoseOtherRingBearer
         | TriggerCondition::FirstCombatPhaseOfTurn
         | TriggerCondition::HasMaxSpeed
         // CR 725.1: no `legacy_player_scope` classifier exists, and both scopes
@@ -6685,6 +6686,10 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         // same printed clause.
         // M3 binding mandate: precise RHS, so bind every payload field.
         TriggerCondition::ControlsCommander { ownership: _ } => commander_control_read(),
+        // CR 701.54a + CR 701.54d: consumes the triggering event's snapshotted
+        // bearer — an event-live read, so the profile mirrors the other
+        // event-consuming intervening-ifs.
+        TriggerCondition::ChoseOtherRingBearer => reads_event_live(),
     }
 }
 
@@ -9086,6 +9091,17 @@ mod tests {
         assert!(
             !rw_ability_condition(&legacy).legacy_batch_prompt(),
             "the legacy ManaColorSpent arm reads nothing; pinned so the delta stays visible"
+        );
+    }
+    /// Review #7820 round 5: the condition is an event-live read, mirroring the
+    /// other event-consuming intervening-ifs.
+    #[test]
+    fn chose_other_ring_bearer_reads_the_event_live() {
+        use crate::types::ability::TriggerCondition;
+
+        assert_eq!(
+            rw_trigger_condition(&TriggerCondition::ChoseOtherRingBearer),
+            reads_event_live()
         );
     }
 }
