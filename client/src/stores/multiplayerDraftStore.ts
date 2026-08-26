@@ -26,6 +26,7 @@ import type { DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from ".
 import type { AISeatBinding } from "../game/controllers/aiController";
 import { createGameLoopController, type GameLoopController } from "../game/controllers/gameLoopController";
 import { processRemoteUpdate } from "../game/dispatch";
+import { reportStructuredActionRejection } from "../game/actionRejectionReporter";
 import { useGameStore } from "./gameStore";
 import {
   DraftPodHostAdapter,
@@ -1385,7 +1386,18 @@ export const useMultiplayerDraftStore = create<
     if (!adapter) return;
     // Re-check immediately before crossing the host, guest, native, or WASM sink.
     const actor = launch.type === "HumanGuest" ? 1 : 0;
-    await adapter.submitAction(intergameAction(command.payload), actor);
+    try {
+      await adapter.submitAction(intergameAction(command.payload), actor);
+    } catch (err) {
+      if (reportStructuredActionRejection(err) !== "not-structured") {
+        const message = err instanceof Error ? err.message : String(err);
+        controller.reject(command.commandId, acknowledgement, message);
+        await saveDraftIntergameCommands(command.matchId, controller.snapshot());
+        if (command.payload.type === "SubmitSideboard") set({ sideboardSubmitted: false });
+        return;
+      }
+      throw err;
+    }
     const receipted = controller.receipt(command.commandId, acknowledgement, crypto.randomUUID());
     if (!receipted) return;
     await saveDraftIntergameCommands(command.matchId, controller.snapshot());
