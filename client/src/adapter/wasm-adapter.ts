@@ -3,7 +3,6 @@ import type {
   AiDecisionDiagnosticReceipt,
   AiDecisionDiagnosticsCapability,
   AiProposalSubmission,
-  BatchResolveResult,
   EngineAdapter,
   EngineSnapshot,
   FormatConfig,
@@ -14,6 +13,8 @@ import type {
   ObjectId,
   PersistedGameState,
   PlayerId,
+  RestoredGameStateResult,
+  RestoredStackAutomationPresentation,
   SubmitResult,
   ViewerSnapshot,
 } from "./types";
@@ -717,23 +718,6 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     }
   }
 
-  async resolveAll(
-    requester: number,
-    aiSeats: { playerId: number; difficulty: string }[],
-    maxResolutions: number = 0,
-  ): Promise<BatchResolveResult> {
-    this.assertInitialized();
-    try {
-      const result = this.engine
-        ? await this.engine.resolveAll(requester, aiSeats, maxResolutions)
-        : await this.fallback!.resolveAll(requester, aiSeats, maxResolutions);
-      this.invalidateAiDecisionDiagnostics();
-      return result;
-    } catch (err) {
-      throw await classifyEngineErrorAsync(err, this.takePanic);
-    }
-  }
-
   private async requireCardDbForRestore(): Promise<void> {
     await this.ensureCardDb();
     // Soft-failed ensureCardDb leaves cardDbLoaded false and skips
@@ -752,6 +736,26 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     if (this.engine) await this.engine.restoreState(json);
     else await this.fallback!.restoreState(json);
     this.invalidateAiDecisionDiagnostics();
+  }
+
+  async resumeRestoredGameState(): Promise<RestoredGameStateResult> {
+    this.assertInitialized();
+    try {
+      const resumed = this.engine
+        ? await this.engine.resumeRestoredGameState()
+        : await this.fallback!.resumeRestoredGameState();
+      this.invalidateAiDecisionDiagnostics();
+      return {
+        presentation: resumed.presentation,
+        snapshot: {
+          state: unwrapClientGameState(resumed.snapshot.state),
+          legalResult: resumed.snapshot.legalResult,
+          seq: nextSnapshotSeq(),
+        },
+      };
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
   }
 
   /**
@@ -826,15 +830,24 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    * Distinct from `restoreState` (undo semantics, deterministic re-seed).
    * Mirrors `server-core::GameSession::from_persisted`.
    */
-  async resumeMultiplayerHostState(state: PersistedGameState): Promise<void> {
+  async resumeMultiplayerHostState(state: PersistedGameState): Promise<RestoredGameStateResult> {
     this.assertInitialized();
     // Same CARD_DB requirement as restoreState — resume rehydrates abilities
     // only when the DB is loaded (engine-wasm resume_multiplayer_host_state).
     await this.requireCardDbForRestore();
     const json = JSON.stringify(state);
-    if (this.engine) await this.engine.resumeMultiplayerHostState(json);
-    else await this.fallback!.resumeMultiplayerHostState(json);
+    const resumed = this.engine
+      ? await this.engine.resumeMultiplayerHostState(json)
+      : await this.fallback!.resumeMultiplayerHostState(json);
     this.invalidateAiDecisionDiagnostics();
+    return {
+      presentation: resumed.presentation,
+      snapshot: {
+        state: unwrapClientGameState(resumed.snapshot.state),
+        legalResult: resumed.snapshot.legalResult,
+        seq: nextSnapshotSeq(),
+      },
+    };
   }
 
   /** Clear the WASM game state without terminating the worker. */
@@ -1075,11 +1088,6 @@ interface MainThreadFallback {
   submitAction(action: GameAction, actor: PlayerId): Promise<SubmitResult>;
   submitInteraction(submission: InteractionSubmission, actor: PlayerId): Promise<SubmitResult>;
   previewManaPayment(action: GameAction, actor: PlayerId): Promise<ObjectId[]>;
-  resolveAll(
-    requester: number,
-    aiSeats: { playerId: number; difficulty: string }[],
-    maxResolutions?: number,
-  ): Promise<BatchResolveResult>;
   getState(): Promise<GameState>;
   getFilteredState(viewerId: number): Promise<GameState>;
   getLegalActions(): Promise<LegalActionsResult>;
@@ -1094,7 +1102,8 @@ interface MainThreadFallback {
   submitAiActionProposal(proposal: AiActionProposal): Promise<AiProposalSubmission>;
   exportState(): Promise<string>;
   restoreState(stateJson: string): Promise<void>;
-  resumeMultiplayerHostState(stateJson: string): Promise<void>;
+  resumeRestoredGameState(): Promise<RestoredFallbackResult>;
+  resumeMultiplayerHostState(stateJson: string): Promise<RestoredFallbackResult>;
   setMultiplayerMode(enabled: boolean): void;
   applySeatMutation(stateJson: string, mutationJson: string): Promise<unknown>;
   projectSeatView(stateJson: string): Promise<unknown>;
@@ -1121,6 +1130,11 @@ interface MainThreadFallback {
   getCardParseDetails(cardName: string): Promise<unknown>;
   getCardRulings(cardName: string): Promise<unknown>;
 }
+
+type RestoredFallbackResult = {
+  presentation: RestoredStackAutomationPresentation;
+  snapshot: { state: GameState; legalResult: LegalActionsResult };
+};
 
 /**
  * Raise an initialize-envelope failure as the typed error the worker path
@@ -1185,11 +1199,6 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
       enqueue(() => {
         return unwrapActionOutcome<ObjectId[]>(wasm.preview_mana_payment_js(actor, action));
       }),
-
-    resolveAll: (requester, aiSeats, maxResolutions = 0) =>
-      enqueue(() => unwrapActionOutcome<BatchResolveResult>(
-        wasm.resolve_all(requester, JSON.stringify(aiSeats), maxResolutions),
-      )),
 
     // null from any of these three getters means WASM `GAME_STATE` is None
     // (worker restart, PWA update desync, panic recovery). Throw with the
@@ -1266,8 +1275,23 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     restoreState: (stateJson: string) =>
       enqueue(() => wasm.restore_game_state(stateJson)),
 
+    resumeRestoredGameState: () =>
+      enqueue(() => ({
+        presentation: wasm.resume_restored_game_state() as RestoredStackAutomationPresentation,
+        snapshot: {
+          state: wasm.get_game_state() as GameState,
+          legalResult: wasm.get_legal_actions_js() as LegalActionsResult,
+        },
+      })),
+
     resumeMultiplayerHostState: (stateJson: string) =>
-      enqueue(() => wasm.resume_multiplayer_host_state(stateJson)),
+      enqueue(() => ({
+        presentation: wasm.resume_multiplayer_host_state(stateJson) as RestoredStackAutomationPresentation,
+        snapshot: {
+          state: wasm.get_game_state() as GameState,
+          legalResult: wasm.get_legal_actions_js() as LegalActionsResult,
+        },
+      })),
 
     setMultiplayerMode: (enabled: boolean) => {
       enqueue(() => wasm.set_multiplayer_mode(enabled));
