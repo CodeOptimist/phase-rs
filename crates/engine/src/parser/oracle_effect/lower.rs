@@ -2940,6 +2940,7 @@ fn ability_reads_last_created(def: &AbilityDefinition) -> bool {
             | TargetFilter::LastRevealed
             | TargetFilter::LastZoneChanged
             | TargetFilter::CostPaidObject
+            | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::ExiledBySource
