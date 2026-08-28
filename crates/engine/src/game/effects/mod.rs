@@ -720,7 +720,7 @@ pub(crate) fn mark_pending_continuation_parent(state: &mut GameState, kind: Effe
 /// All `pending_continuation.take()` sites should use this helper rather
 /// than rolling their own `take + resolve_ability_chain`, so the parent
 /// event is never silently dropped.
-fn restore_continuation_trigger_firing(
+pub(super) fn restore_continuation_trigger_firing(
     state: &mut GameState,
     continuation_firing: Option<crate::types::identifiers::TriggerFiring>,
 ) {
@@ -814,7 +814,13 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             search_attach_host,
             trigger_context,
             trigger_firing,
+            attachment_choice,
+            attachment_remainder: _,
         } = cont;
+        debug_assert!(
+            attachment_choice.is_none(),
+            "an attachment choice must be consumed by its EffectZoneChoice handler"
+        );
         restore_continuation_trigger_firing(state, trigger_firing);
         state.resolving_continuation_attach_host = search_attach_host;
         let source_id = chain.source_id;
@@ -1081,10 +1087,11 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
             // authorize a synthetic entry completion.
         }
         ResolutionFrame::PostReplacement(drains) => {
-            if matches!(
+            let retired_paused_dispatch = matches!(
                 drains.resident().map(|drain| &drain.status),
                 Some(crate::types::game_state::DrainStatus::Paused)
-            ) {
+            );
+            if retired_paused_dispatch {
                 // CR 614.6 + CR 615.5: the direct child has answered the
                 // continuation's prompt, so retire precisely the resident
                 // paused dispatch before considering later ready work.
@@ -1107,6 +1114,19 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
                         .take_active_post_replacement()
                         .expect("post-replacement dispatcher may remove only its active frame");
                 }
+            }
+            // CR 608.2c + CR 614.12a + CR 615.5: Retiring a paused replacement
+            // dispatch can expose the next ordinary continuation. Drain that
+            // exact continuation before priority; if it is the remaining
+            // Attach operation, its own completion boundary owns the printed
+            // tail. A typed Attach-choice owner remains action-owned.
+            if retired_paused_dispatch
+                && matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && state
+                    .active_ability_continuation()
+                    .is_some_and(|continuation| continuation.attachment_choice.is_none())
+            {
+                drain_pending_continuation(state, events);
             }
         }
     }
@@ -1830,6 +1850,8 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
             search_attach_host,
             trigger_context,
             trigger_firing,
+            attachment_choice,
+            attachment_remainder,
         } = existing;
         super::ability_utils::append_to_sub_chain(&mut head, *chain);
         state.push_ability_continuation(AbilityContinuationFrame {
@@ -1842,6 +1864,8 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
                 // re-latched to whatever is live at splice time.
                 trigger_context,
                 trigger_firing,
+                attachment_choice,
+                attachment_remainder,
             },
             choose_zone_trigger_context: frame.choose_zone_trigger_context,
         });
@@ -10263,6 +10287,26 @@ fn should_repeat_while_condition(
     true
 }
 
+/// Whether `pending` is the remaining, already-bound subset of `ability`'s
+/// Attach operation after an earlier selected attachment raised a child.
+///
+/// The strict subset is the provenance proof: a merely similar Attach
+/// continuation is not enough to claim ownership of this instruction's tail.
+fn is_bound_attach_remainder_for(pending: &PendingContinuation, ability: &ResolvedAbility) -> bool {
+    let remaining = pending.chain.attach_attachment_targets();
+    let selected = ability.attach_attachment_targets();
+    pending
+        .attachment_remainder
+        .as_ref()
+        .is_some_and(|remainder| remainder.producer.as_ref() == ability)
+        && pending.attachment_choice.is_none()
+        && matches!(pending.chain.effect, Effect::Attach { .. })
+        && pending.chain.sub_ability.is_none()
+        && !remaining.is_empty()
+        && remaining.len() < selected.len()
+        && remaining.iter().all(|target| selected.contains(target))
+}
+
 /// One full pass of an ability's resolution chain — the parent effect (with its
 /// `repeat_for` count loop) and the entire `sub_ability` chain. This is one
 /// "process" for the purposes of "repeat this process" (CR 608.2c). Extracted
@@ -12192,17 +12236,36 @@ fn resolve_chain_body(
         }
     }
 
+    // CR 608.2c + CR 400.7: A Dig's kept-card delivery can complete before its
+    // continuation resumes, so its enclosing resumed resolver has no local
+    // ZoneChanged event slice. Its continuation carries the settled kept cards
+    // as object targets; the mutable "this way" ledger may now describe the
+    // later rest-pile delivery. Other forward-result effects remain event-slice
+    // scoped.
+    //
     // Extract moved objects for result forwarding when forward_result is set.
     // Used for "put onto the battlefield attached to [source]" patterns where the
     // moved card becomes the sub-ability's source and the original source becomes a target.
     let forwarded_objects: Vec<ObjectId> = if ability.forward_result {
-        events[events_before..]
+        let moved: Vec<_> = events[events_before..]
             .iter()
             .filter_map(|e| match e {
                 GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                 _ => None,
             })
-            .collect()
+            .collect();
+        if moved.is_empty() && matches!(ability.effect, Effect::Dig { .. }) {
+            ability
+                .targets
+                .iter()
+                .filter_map(|target| match target {
+                    TargetRef::Object(id) => Some(*id),
+                    TargetRef::Player(_) => None,
+                })
+                .collect()
+        } else {
+            moved
+        }
     } else {
         vec![]
     };
@@ -12873,6 +12936,38 @@ fn resolve_chain_body(
         {
             return Ok(());
         }
+        // CR 608.2c + CR 616.1: An Attach choice or a bound remaining subset
+        // already split this node's trailing instructions into an outer
+        // continuation. An Attached replacement can leave either owner beneath
+        // its active child frame. The generic pause path must not prepend that
+        // same tail onto the child operation.
+        let attach_child_already_owns_tail = matches!(ability.effect, Effect::Attach { .. })
+            && (state
+                .resolution_stack
+                .ability_continuations()
+                .any(|pending| {
+                    pending.attachment_choice.is_some()
+                        || is_bound_attach_remainder_for(pending, ability)
+                })
+                || state
+                    .resolution_stack
+                    .has_active_post_replacement_attach_choice_pair()
+                || state
+                    .active_post_replacement_drains()
+                    .and_then(crate::types::game_state::PostReplacementDrainStack::resident)
+                    .and_then(|drain| drain.source)
+                    .is_some_and(|source_id| {
+                        ability
+                            .attach_attachment_targets()
+                            .iter()
+                            .position(|attachment| attachment.object_id == source_id)
+                            .is_some_and(|index| {
+                                index + 1 < ability.attach_attachment_targets().len()
+                            })
+                    }));
+        if attach_child_already_owns_tail {
+            return Ok(());
+        }
         // If resolve_effect just entered a player-choice state (Scry/Dig/Surveil),
         // save the sub-ability as a continuation to execute after the player responds,
         // rather than immediately processing it (which would bypass the UI).
@@ -13038,6 +13133,8 @@ fn resolve_chain_body(
             return Ok(());
         } else if !forwarded_objects.is_empty() {
             let mut sub_with_context = sub.as_ref().clone();
+            let attachment_candidates =
+                attach::attachment_candidates_from_zone_change(state, sub, &forwarded_objects);
             // CR 707.10: `CopySpell { SelfRef }` copies the resolving spell
             // itself (Sevinne's Reclamation, Chain cycle). `forward_result`
             // rebinding `source_id` to the just-moved permanent would make
@@ -13164,6 +13261,9 @@ fn resolve_chain_body(
                 effect_context_object.as_ref(),
                 state,
             );
+            if !attachment_candidates.is_empty() {
+                sub_with_context.bind_attach_attachment_candidates(attachment_candidates);
+            }
             resolve_ability_chain(state, &sub_with_context, events, depth + 1)?;
         } else if sub.targets.is_empty()
             && !state.last_revealed_ids.is_empty()
@@ -14892,7 +14992,7 @@ mod tests {
     };
     use crate::types::identifiers::{
         CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken, ObjectId,
-        TrackedSetId, TriggerFiring,
+        ObjectIncarnationRef, TrackedSetId, TriggerFiring,
     };
     use crate::types::keywords::Keyword;
     use crate::types::keywords::KeywordKind;
@@ -14937,6 +15037,42 @@ mod tests {
             PlayerId(0),
         )
         .condition(AbilityCondition::WhenYouDo)
+    }
+
+    #[test]
+    fn bound_attach_remainder_requires_exact_producer_provenance() {
+        let state = GameState::new_two_player(42);
+        let first = ObjectIncarnationRef::of(ObjectId(1), 0);
+        let second = ObjectIncarnationRef::of(ObjectId(2), 0);
+        let mut producer = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::Any,
+                target: TargetFilter::Any,
+            },
+            Vec::new(),
+            ObjectId(100),
+            PlayerId(0),
+        );
+        producer.set_attach_attachment_targets(vec![first, second]);
+
+        let mut remainder_chain = producer.clone();
+        remainder_chain.set_attach_attachment_targets(vec![second]);
+        let mut pending = PendingContinuation::new(Box::new(remainder_chain), &state);
+        pending.attachment_remainder = Some(crate::types::game_state::PendingAttachmentRemainder {
+            producer: Box::new(producer.clone()),
+        });
+
+        assert!(
+            is_bound_attach_remainder_for(&pending, &producer),
+            "the stamped producer owns its bound remaining attachment subset"
+        );
+
+        let mut distinct_producer = producer.clone();
+        distinct_producer.source_id = ObjectId(101);
+        assert!(
+            !is_bound_attach_remainder_for(&pending, &distinct_producer),
+            "the same selected subset from a distinct Attach producer cannot claim this tail"
+        );
     }
 
     /// CR 608.2c + CR 614.6: a destination-bound "this way" rider must not

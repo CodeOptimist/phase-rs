@@ -930,6 +930,21 @@ impl ResolutionStack {
         }
     }
 
+    /// Consume only an active continuation that owns an Attach
+    /// `EffectZoneChoice`; callers must never take a generic continuation just
+    /// because the current UI prompt happens to be an Attach choice.
+    pub fn take_active_attachment_choice_continuation(
+        &mut self,
+    ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
+        if !self
+            .active_ability_continuation()
+            .is_some_and(|frame| frame.pending.attachment_choice.is_some())
+        {
+            return Ok(None);
+        }
+        self.take_active_ability_continuation()
+    }
+
     /// Consumes the active continuation, or its exact parent when a
     /// `BatchDelivery` child currently owns the stack top. The batch remains
     /// parked so its undelivered zone-change members settle before the enclosing
@@ -2798,6 +2813,62 @@ impl ResolutionStack {
     pub fn active_predecessor(&self) -> Option<&ResolutionFrame> {
         let top = self.frames.top()?;
         self.frames.get(self.frames.below(top)?)
+    }
+
+    /// True only when the active post-replacement frame is immediately above
+    /// the typed Attach-choice child that owns the interrupted operation.
+    ///
+    /// This is a positional lifecycle predicate, not a search for a buried
+    /// continuation. The child must remain marked until both frames retire
+    /// together; otherwise the ordinary continuation drain would replay its
+    /// already-resolved Attach instruction.
+    pub fn has_active_post_replacement_attach_choice_pair(&self) -> bool {
+        let Some(post_replacement) = self.frames.top() else {
+            return false;
+        };
+        let Some(attachment_child) = self.frames.below(post_replacement) else {
+            return false;
+        };
+        if !matches!(
+            (self.frames.get(attachment_child), self.frames.get(post_replacement)),
+            (
+                Some(ResolutionFrame::AbilityContinuation(child)),
+                Some(ResolutionFrame::PostReplacement(_)),
+            ) if child.pending.attachment_choice.is_some()
+        ) {
+            return false;
+        }
+        true
+    }
+
+    /// Retires the exact empty post-replacement/Attach-choice pair at the
+    /// active boundary.
+    ///
+    /// The post-replacement frame is popped first so its marked Attach child
+    /// becomes active, then the child is popped before generic continuation
+    /// draining can replay the consumed Attach operation. A nonempty drain or
+    /// any other frame shape is deliberately left untouched.
+    pub fn take_active_empty_post_replacement_attach_choice_pair(&mut self) -> bool {
+        if !self.has_active_post_replacement_attach_choice_pair()
+            || !self.last().is_some_and(|frame| {
+                matches!(
+                    frame,
+                    ResolutionFrame::PostReplacement(drains) if drains.is_empty()
+                )
+            })
+        {
+            return false;
+        }
+
+        let _ = self
+            .take_active_post_replacement()
+            .expect("an empty post-replacement Attach pair must keep its owner active")
+            .expect("an empty post-replacement Attach pair must retain its owner");
+        let _ = self
+            .take_active_attachment_choice_continuation()
+            .expect("the post-replacement Attach pair must expose its child")
+            .expect("the post-replacement Attach pair must retain its child");
+        true
     }
 
     /// True only for the live general-drain/draw pair at the active stack

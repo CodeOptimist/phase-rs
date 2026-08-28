@@ -2382,6 +2382,25 @@ pub struct CommanderDamageEntry {
 /// without the other and break the "pause emits the same event as
 /// non-pause" invariant.
 ///
+/// The exact resolution-time Attach instruction that owns an
+/// `EffectZoneChoice`. The operation stays typed across a host choice followed
+/// by an attachment choice; its enclosing continuation frame carries only the
+/// later printed chain tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAttachmentChoice {
+    pub operation: Box<ResolvedAbility>,
+}
+
+/// The exact Attach instruction that created an ordinary continuation for its
+/// remaining already-selected attachments. This is distinct from
+/// [`PendingAttachmentChoice`]: no player choice owns this continuation, but
+/// the producer identity proves which Attach instruction already split off its
+/// printed tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAttachmentRemainder {
+    pub producer: Box<ResolvedAbility>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingContinuation {
     pub chain: Box<ResolvedAbility>,
@@ -2403,6 +2422,14 @@ pub struct PendingContinuation {
     /// paused, then restored before the continuation resumes resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) trigger_firing: Option<TriggerFiring>,
+    /// A child Attach choice owns this operation while its normal continuation
+    /// parent retains only the following instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_choice: Option<PendingAttachmentChoice>,
+    /// The producer identity for an ordinary continuation containing only the
+    /// unprocessed members of a selected multi-attachment operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_remainder: Option<PendingAttachmentRemainder>,
 }
 
 impl PendingContinuation {
@@ -2416,6 +2443,8 @@ impl PendingContinuation {
             search_attach_host: None,
             trigger_context: ResolvingTriggerContext::capture(state),
             trigger_firing: state.resolving_trigger_firing,
+            attachment_choice: None,
+            attachment_remainder: None,
         }
     }
 
@@ -2434,6 +2463,8 @@ impl PendingContinuation {
             search_attach_host: None,
             trigger_context: ResolvingTriggerContext::capture(state),
             trigger_firing: state.resolving_trigger_firing,
+            attachment_choice: None,
+            attachment_remainder: None,
         }
     }
 }
@@ -5292,6 +5323,195 @@ pub struct CloakExileMember {
     pub attachments: Vec<ObjectId>,
 }
 
+/// CR 614.1 + CR 616.1 + CR 400.7: The settled subset of a Dig's chosen cards.
+/// The choice itself is not an outcome: replacements may redirect or prevent
+/// individual zone changes, so downstream "this way" instructions consume only
+/// selected incarnations that arrived at the requested destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigKeptDeliveryOutcome {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Zone>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled: bool,
+}
+
+impl DigKeptDeliveryOutcome {
+    pub fn pending(state: &GameState, selected: Vec<ObjectId>, destination: Zone) -> Self {
+        Self {
+            selected: selected
+                .into_iter()
+                .filter_map(|id| {
+                    state
+                        .objects
+                        .get(&id)
+                        .map(ObjectIncarnationRef::from_object)
+                })
+                .collect(),
+            completed: Vec::new(),
+            destination: Some(destination),
+            settled: false,
+        }
+    }
+
+    /// CR 614.1 + CR 616.1 + CR 400.7: Records only selected incarnations whose
+    /// final, settled zone is the requested destination after replacements.
+    pub fn settle_from_logical_group(&mut self, state: &GameState, group: &LogicalZoneChangeGroup) {
+        let Some(destination) = self.destination.filter(|_| !self.settled) else {
+            return;
+        };
+        let moved: BTreeSet<_> = group
+            .all_origin_occurrences
+            .iter()
+            .filter_map(|occurrence| match &occurrence.event {
+                // A replacement can leave an intermediate `ZoneChanged` event
+                // behind while ultimately redirecting the card elsewhere. The
+                // settled object's current zone is therefore the authority for
+                // the requested-destination arrival, not that intermediate
+                // event alone.
+                GameEvent::ZoneChanged { object_id, to, .. }
+                    if *to == destination
+                        && state
+                            .objects
+                            .get(object_id)
+                            .is_some_and(|object| object.zone == destination) =>
+                {
+                    Some(*object_id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.completed = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|identity| moved.contains(&identity.object_id))
+            .collect();
+        self.settled = true;
+    }
+
+    pub fn selected_ids(&self) -> Vec<ObjectId> {
+        self.selected
+            .iter()
+            .map(|identity| identity.object_id)
+            .collect()
+    }
+
+    pub fn completed_ids(&self) -> Vec<ObjectId> {
+        self.completed
+            .iter()
+            .map(|identity| identity.object_id)
+            .collect()
+    }
+}
+
+/// The settled subset of a Dig's unkept rest pile. This is deliberately
+/// independent from [`DigKeptDeliveryOutcome`]: the two zone-change groups can
+/// settle at different times and replacements can redirect either group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigRestDeliveryOutcome {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Zone>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled: bool,
+}
+
+impl DigRestDeliveryOutcome {
+    pub fn pending(state: &GameState, selected: Vec<ObjectId>, destination: Zone) -> Self {
+        Self {
+            selected: selected
+                .into_iter()
+                .filter_map(|id| {
+                    state
+                        .objects
+                        .get(&id)
+                        .map(ObjectIncarnationRef::from_object)
+                })
+                .collect(),
+            completed: Vec::new(),
+            destination: Some(destination),
+            settled: false,
+        }
+    }
+
+    pub fn settle_from_logical_group(&mut self, state: &GameState, group: &LogicalZoneChangeGroup) {
+        let Some(destination) = self.destination.filter(|_| !self.settled) else {
+            return;
+        };
+        let moved: BTreeSet<_> = group
+            .all_origin_occurrences
+            .iter()
+            .filter_map(|occurrence| match &occurrence.event {
+                GameEvent::ZoneChanged { object_id, to, .. }
+                    if *to == destination
+                        && state
+                            .objects
+                            .get(object_id)
+                            .is_some_and(|object| object.zone == destination) =>
+                {
+                    Some(*object_id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.completed = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|identity| moved.contains(&identity.object_id))
+            .collect();
+        self.settled = true;
+    }
+
+    pub fn completed_ids(&self) -> Vec<ObjectId> {
+        self.completed
+            .iter()
+            .map(|identity| identity.object_id)
+            .collect()
+    }
+}
+
+/// Identifies which half of a Dig is settling through a shared rest-pile
+/// completion. A kept delivery can pause before the rest-pile routing begins,
+/// while each half needs its own settled-object outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DigDeliveryStage {
+    Kept,
+    #[default]
+    Rest,
+}
+
+/// CR 614.1 + CR 616.1 + CR 400.7: Stamp a Dig delivery completion with its
+/// exact settled destination arrivals. Only the zone pipeline owns a complete
+/// logical group, so this is the single seam where a selected pile becomes an
+/// actual delivery outcome.
+pub(crate) fn settle_dig_delivery_outcome(
+    completion: &mut BatchCompletion,
+    state: &GameState,
+    group: &LogicalZoneChangeGroup,
+) {
+    match completion {
+        BatchCompletion::RevealRestPile {
+            delivery_stage: DigDeliveryStage::Kept,
+            kept_delivery,
+            ..
+        } => kept_delivery.settle_from_logical_group(state, group),
+        BatchCompletion::RevealRestPile {
+            delivery_stage: DigDeliveryStage::Rest,
+            rest_delivery,
+            ..
+        } => rest_delivery.settle_from_logical_group(state, group),
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchCompletion {
     /// CR 303.4g + CR 614.1 + CR 616.1: A return-as-Aura host had no legal
@@ -5430,20 +5650,6 @@ pub enum BatchCompletion {
         /// Normalized placement requested by the original instruction.
         library_position: LibraryPosition,
     },
-    /// CR 614.1 + CR 616.1 + CR 608.2c: A Dig kept-card batch settled outside
-    /// the battlefield. Its rest routing, tracked-set publication, and
-    /// continuation drain must follow the delivery, while the published set and
-    /// parent-target continuation set remain independently typed.
-    DigKeptDeliveryComplete {
-        player: PlayerId,
-        source_id: Option<ObjectId>,
-        rest_cards: Vec<ObjectId>,
-        rest_destination: Zone,
-        #[serde(default)]
-        rest_order: DigRestOrder,
-        publish_tracked_set: Vec<ObjectId>,
-        continuation_targets: Vec<ObjectId>,
-    },
     /// CR 701.13a + CR 614.1 + CR 616.1: A per-category exile member has
     /// settled, so its tracked-set extension and next-member prompt can run.
     ForEachCategoryExileComplete {
@@ -5481,6 +5687,10 @@ pub enum BatchCompletion {
     /// runs exactly once after the kept delivery settles — otherwise the rest
     /// cards strand in the library (the early-`return` bug).
     RevealRestPile {
+        /// A Dig first carries the kept delivery through this completion, then
+        /// changes to `Rest` before it routes the deferred unkept pile.
+        #[serde(default)]
+        delivery_stage: DigDeliveryStage,
         /// The player whose continuation drains after the pile lands.
         player: PlayerId,
         /// CR 400.7: The resolving effect's source, preserved so any rest-pile
@@ -5520,6 +5730,20 @@ pub enum BatchCompletion {
         /// pile. `None` for every non-manifest rest pile.
         #[serde(default)]
         manifested_for_continuation: Option<ObjectId>,
+        /// Dig's selected-delivery carrier, retained when a battlefield entry
+        /// re-parks the rest-pile completion. Empty for non-Dig callers.
+        #[serde(default)]
+        kept_delivery: DigKeptDeliveryOutcome,
+        /// Dig's ParentTarget continuation inputs. They stay separate from the
+        /// publish set because the latter can intentionally address the rest
+        /// pile while ParentTarget still refers to the kept delivery.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        continuation_targets: Vec<ObjectId>,
+        /// The exact unkept rest identities that completed their requested
+        /// delivery. It is separate from the kept delivery because its logical
+        /// zone-change group can settle later, after a replacement-choice park.
+        #[serde(default)]
+        rest_delivery: DigRestDeliveryOutcome,
     },
     /// CR 608.2c + CR 616.1: The rest half of a deterministic mass Dig settled
     /// after a replacement choice. Resume its selected-card delivery only now,
@@ -19846,6 +20070,23 @@ impl GameState {
         })
     }
 
+    /// Insert a continuation immediately outside the exact child stack raised
+    /// after `child_stack_start` was captured by its producer.
+    pub fn insert_ability_continuation_parent_at_child_boundary(
+        &mut self,
+        pending: PendingContinuation,
+        child_stack_start: ChildStackDepth,
+    ) -> Result<(), ResolutionStackError> {
+        let choose_zone_trigger_context = pending.trigger_context.clone();
+        self.resolution_stack.insert_parent_at_child_boundary(
+            super::resolution::ResolutionFrame::AbilityContinuation(AbilityContinuationFrame {
+                pending,
+                choose_zone_trigger_context,
+            }),
+            child_stack_start,
+        )
+    }
+
     /// Inserts the continuation outside an active general-drain/draw pair so
     /// the paused `PostReplacement` frame remains the draw's exact immediate
     /// parent until the child draw is complete.
@@ -19896,6 +20137,14 @@ impl GameState {
         &mut self,
     ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
         self.resolution_stack.take_active_ability_continuation()
+    }
+
+    /// Consume only the continuation that owns the active Attach choice.
+    pub fn take_active_attachment_choice_continuation(
+        &mut self,
+    ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
+        self.resolution_stack
+            .take_active_attachment_choice_continuation()
     }
 
     /// Clear the active continuation when the enclosing resolution is
@@ -21004,14 +21253,21 @@ impl GameState {
             .finish_post_replacement_dispatch(dispatch)
     }
 
-    /// Retires only the exact top general drain whose continuation paused and
-    /// whose MultiDraw child has already completed.
+    /// CR 608.2c + CR 614.1a: Retires the exact top general drain after its
+    /// interrupted instruction completes. An empty Attach replacement pair
+    /// also retires its marked child before generic continuation draining can
+    /// replay that instruction.
     pub fn finish_active_paused_post_replacement_dispatch(&mut self) {
         let finished = self
             .active_post_replacement_drains_mut()
             .and_then(PostReplacementDrainStack::finish_paused_dispatch);
         if finished.is_some() {
-            self.remove_empty_active_post_replacement_frame();
+            if !self
+                .resolution_stack
+                .take_active_empty_post_replacement_attach_choice_pair()
+            {
+                self.remove_empty_active_post_replacement_frame();
+            }
             // CR 614.12a + CR 614.13a: a Devour-only ChangeZone snapshot stays
             // resident while its exact post-replacement child resolves. Once that
             // child is retired, the snapshot is again the active owner and its
